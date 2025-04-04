@@ -108,7 +108,7 @@ torchrun \
   --rdzv_backend=c10d \
   --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
   --node_rank=$NODE_RANK \
-  src/train.py \
+  scripts/train.py \
   --config "$CONFIG_FILE" \
   2>&1 | tee "$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log" || handle_failure $?
 

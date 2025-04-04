@@ -351,9 +351,18 @@ def evaluate_checkpoint(checkpoint_path: str, config_path: str, experiment_name:
     
     # 1. First run the model analyzer to get parameter stats
     analyzer_results_path = os.path.join(results_dir, "model_analysis.json")
-    
+
+    # Correct path for size.py
+    size_script_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), # Assumes ablation.py is in llm/training
+        "llm", "utils", "eval", "size.py"
+    )
+    if not os.path.exists(size_script_path):
+         # Fallback if structure assumption is wrong, try relative from project root
+         size_script_path = "llm/utils/eval/size.py"
+
     cmd = [
-        "python", "utils/eval/size.py",
+        "python", size_script_path,
         "--config", config_path,
         "--checkpoint", checkpoint_path,
         "--output", os.path.join(results_dir, "model_analysis.png"),
@@ -385,16 +394,18 @@ def evaluate_checkpoint(checkpoint_path: str, config_path: str, experiment_name:
     except Exception as e:
         print(f"Error running model analysis: {e}")
     
-    # 2. Run perplexity evaluation
+    # 2. Run perplexity evaluation using llm-eval entry point
     perplexity_results_path = os.path.join(results_dir, "perplexity.json")
     cmd = [
-        "python", "utils/eval/perplexity.py",
+        "llm-eval", "perplexity",
         "--config", config_path,
         "--checkpoint", checkpoint_path,
         "--output", perplexity_results_path
+        # Add other perplexity args if needed, e.g., --device
     ]
-    
+
     print(f"Evaluating perplexity for experiment: {experiment_name}")
+    print(f"Command: {' '.join(cmd)}")
     try:
         process = subprocess.run(
             cmd,
@@ -421,56 +432,41 @@ def evaluate_checkpoint(checkpoint_path: str, config_path: str, experiment_name:
     # 3. Run comprehensive benchmark evaluations
     # Define our suite of benchmarks
     benchmarks = [
-        {
-            "name": "aime_2024",
-            "display_name": "AIME 2024",
-            "script": "utils/eval/benchmark.py",
-            "args": ["--benchmark", "aime_2024", "--metric", "pass@1"]
-        },
-        {
-            "name": "codeforces",
-            "display_name": "Codeforces",
-            "script": "utils/eval/benchmark.py",
-            "args": ["--benchmark", "codeforces", "--metric", "percentile"]
-        },
-        {
-            "name": "gpqa_diamond",
-            "display_name": "GPQA Diamond",
-            "script": "utils/eval/benchmark.py",
-            "args": ["--benchmark", "gpqa", "--subset", "diamond", "--metric", "pass@1"]
-        },
-        {
-            "name": "math_500",
-            "display_name": "MATH-500",
-            "script": "utils/eval/benchmark.py",
-            "args": ["--benchmark", "math", "--subset", "500", "--metric", "pass@1"]
-        },
-        {
-            "name": "mmlu",
-            "display_name": "MMLU",
-            "script": "utils/eval/benchmark.py",
-            "args": ["--benchmark", "mmlu", "--metric", "pass@1"]
-        },
-        {
-            "name": "swe_bench",
-            "display_name": "SWE-bench",
-            "script": "utils/eval/benchmark.py",
-            "args": ["--benchmark", "swe_bench", "--subset", "verified", "--metric", "resolved"]
-        }
+        # Define benchmarks using the structure expected by llm-eval benchmark
+        # Format: (benchmark_name, subset, metric, display_name)
+        ("aime_2024", None, "pass@1", "AIME 2024"),
+        ("codeforces", None, "percentile", "Codeforces"), # Also outputs 'rating'
+        ("gpqa", "diamond", "pass@1", "GPQA Diamond"),
+        ("math", "500", "pass@1", "MATH-500"),
+        ("mmlu", None, "pass@1", "MMLU"),
+        ("swe_bench", "verified", "resolved", "SWE-bench"),
     ]
-    
-    # Run each benchmark
-    for benchmark in benchmarks:
-        benchmark_results_path = os.path.join(results_dir, f"{benchmark['name']}_results.json")
-        
+
+    # Run each benchmark using llm-eval
+    for benchmark_name, subset, metric, display_name in benchmarks:
+        benchmark_results_path = os.path.join(results_dir, f"{benchmark_name}_results.json")
+
         cmd = [
-            "python", benchmark["script"],
+            "llm-eval", "benchmark",
             "--config", config_path,
             "--checkpoint", checkpoint_path,
-            "--output", benchmark_results_path
-        ] + benchmark["args"]
-        
-        print(f"Evaluating {benchmark['display_name']} for experiment: {experiment_name}")
+            "--benchmark", benchmark_name,
+            "--output", benchmark_results_path,
+        ]
+        if subset:
+            cmd.extend(["--subset", subset])
+        if metric:
+             # Note: llm-eval might calculate multiple metrics, this specifies the primary one if needed by the script
+             # Or it might be used just for result extraction below. Check llm-eval behavior.
+            cmd.extend(["--metric", metric])
+            primary_metric_key = metric # Assume the specified metric is the key in results JSON
+        else:
+            # Define default primary metric if none specified (adjust as needed)
+            primary_metric_key = "accuracy" if benchmark_name == "mmlu" else "score"
+
+
+        print(f"Evaluating {display_name} for experiment: {experiment_name}")
+        print(f"Command: {' '.join(cmd)}")
         try:
             process = subprocess.run(
                 cmd,
@@ -481,8 +477,8 @@ def evaluate_checkpoint(checkpoint_path: str, config_path: str, experiment_name:
             )
             
             if process.returncode != 0:
-                print(f"{benchmark['display_name']} evaluation failed: {process.stderr}")
-                results[benchmark["name"]] = None
+                print(f"{display_name} evaluation failed: {process.stderr}")
+                results[benchmark_name] = None
             else:
                 # Load benchmark results
                 if os.path.exists(benchmark_results_path):
@@ -490,21 +486,24 @@ def evaluate_checkpoint(checkpoint_path: str, config_path: str, experiment_name:
                         benchmark_data = json.load(f)
                         
                         # Extract the primary metric from the benchmark results
-                        if benchmark["name"] == "codeforces":
-                            results[benchmark["name"]] = benchmark_data.get("percentile", None)
-                            results[f"{benchmark['name']}_rating"] = benchmark_data.get("rating", None)
+                        # Adjust extraction logic based on actual output JSON structure of llm-eval
+                        if benchmark_name == "codeforces":
+                            results[benchmark_name] = benchmark_data.get("percentile", None)
+                            results[f"{benchmark_name}_rating"] = benchmark_data.get("rating", None)
                         else:
-                            # For other benchmarks, extract pass@1 or specified metric
-                            metric_name = benchmark["args"][3]  # Based on the args pattern
-                            results[benchmark["name"]] = benchmark_data.get(metric_name, None)
+                            # Extract the primary metric specified or a default
+                            results[benchmark_name] = benchmark_data.get(primary_metric_key, None)
+                            # Optionally extract other relevant metrics if needed
+                            # e.g., if benchmark_data contains {'accuracy': 0.8, 'f1': 0.75}
+                            # results[f"{benchmark_name}_f1"] = benchmark_data.get("f1", None)
                 else:
-                    results[benchmark["name"]] = None
+                    results[benchmark_name] = None
         except subprocess.TimeoutExpired:
-            print(f"{benchmark['display_name']} evaluation timed out after 2 hours")
-            results[benchmark["name"]] = None
+            print(f"{display_name} evaluation timed out after 2 hours")
+            results[benchmark_name] = None
         except Exception as e:
-            print(f"Error evaluating {benchmark['display_name']}: {e}")
-            results[benchmark["name"]] = None
+            print(f"Error evaluating {display_name}: {e}")
+            results[benchmark_name] = None
     
     # 4. Combine all results and save to file
     combined_results_path = os.path.join(results_dir, "combined_results.json")

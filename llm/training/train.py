@@ -342,7 +342,7 @@ class ModelEvaluator:
         return results
 
 
-def get_train_setup(config, model):
+def get_train_setup(config: TrainerConfig, model: nn.Module):
     """Set up training components based on configuration."""
     # Get optimizer
     optimizer = optim.AdamW(
@@ -350,11 +350,24 @@ def get_train_setup(config, model):
         lr=config.train_config["learning_rate"],
         weight_decay=config.train_config["weight_decay"],
     )
-    
-    # Get scheduler
-    total_steps = config.train_config["num_train_epochs"] * config.train_config.get("steps_per_epoch", 1000)
+
+    # Determine total training steps
+    if config.train_config.get("max_steps"):
+        total_steps = config.train_config["max_steps"]
+        logger.info(f"Training for a maximum of {total_steps} steps.")
+    elif config.train_config.get("num_train_epochs"):
+        # This path is less reliable for IterableDatasets but kept for potential compatibility
+        # A steps_per_epoch value should ideally be provided in the config if using epochs with iterable datasets
+        steps_per_epoch = config.train_config.get("steps_per_epoch")
+        if not steps_per_epoch:
+             raise ValueError("`steps_per_epoch` must be specified in train_config when using `num_train_epochs` with iterable datasets.")
+        total_steps = config.train_config["num_train_epochs"] * steps_per_epoch
+        logger.warning(f"Using num_train_epochs with IterableDataset. Calculated total_steps={total_steps}. Consider using max_steps instead.")
+    else:
+        raise ValueError("Training duration not specified. Set either `max_steps` or `num_train_epochs` (with `steps_per_epoch`) in train_config.")
+
     warmup_steps = int(total_steps * config.train_config["warmup_ratio"])
-    
+
     scheduler = get_scheduler(
         name=config.train_config["lr_scheduler_type"],
         optimizer=optimizer,
@@ -472,43 +485,58 @@ def run_training(config: TrainerConfig):
         accelerator.device,
     )
     
+    # Determine training duration (max_steps)
+    if config.train_config.get("max_steps"):
+        max_steps = config.train_config["max_steps"]
+    elif config.train_config.get("num_train_epochs"):
+        # This path requires steps_per_epoch to be reliable with IterableDataset
+        steps_per_epoch = config.train_config.get("steps_per_epoch")
+        if not steps_per_epoch:
+             raise ValueError("`steps_per_epoch` must be specified in train_config when using `num_train_epochs` with iterable datasets.")
+        max_steps = config.train_config["num_train_epochs"] * steps_per_epoch
+    else:
+         raise ValueError("Training duration not specified. Set either `max_steps` or `num_train_epochs` (with `steps_per_epoch`) in train_config.")
+
     # Load checkpoint if resuming
     global_step = 0
-    epochs_trained = 0
-    steps_trained_in_current_epoch = 0
-    
     if config.train_config["resume_from_checkpoint"]:
+        checkpoint_path = config.train_config["resume_from_checkpoint"]
+        logger.info(f"Attempting to resume from checkpoint: {checkpoint_path}")
         try:
-            global_step, epochs_trained = load_checkpoint(
-                model, optimizer, scheduler, config.train_config["resume_from_checkpoint"]
+            # Assuming load_checkpoint now only returns global_step and epoch (epoch might not be accurate for iterable)
+            loaded_step, _ = load_checkpoint(
+                accelerator.unwrap_model(model), optimizer, scheduler, checkpoint_path
             )
-            logger.info(f"Resuming from step {global_step} in epoch {epochs_trained}")
-            
-            # Skip steps that have already been trained
-            steps_trained_in_current_epoch = global_step % len(train_dataloader)
-            
+            global_step = loaded_step
+            logger.info(f"Successfully resumed from global step {global_step}")
+
         except FileNotFoundError:
-            logger.warning(f"Checkpoint not found at {config.train_config['resume_from_checkpoint']}, starting from scratch")
+            logger.warning(f"Checkpoint not found at {checkpoint_path}, starting from scratch.")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint from {checkpoint_path}: {e}. Starting from scratch.")
     
     # Training loop
     logger.info("Starting training...")
     model.train()
-    
-    total_steps = config.train_config["num_train_epochs"] * len(train_dataloader)
+
     progress_bar = tqdm(
-        total=total_steps,
+        total=max_steps,
         disable=not accelerator.is_local_main_process,
         initial=global_step,
     )
-    
-    # Main training loop
-    for epoch in range(epochs_trained, config.train_config["num_train_epochs"]):
+
+    # Main training loop - iterates up to max_steps
+    completed_steps = 0
+    while global_step < max_steps:
+        model.train() # Ensure model is in training mode at the start of each effective "epoch" or segment
         for step, batch in enumerate(train_dataloader):
-            # Skip steps if resuming from checkpoint
-            if config.train_config["resume_from_checkpoint"] and epoch == epochs_trained and step < steps_trained_in_current_epoch:
-                progress_bar.update(1)
-                continue
-            
+            # Check if max_steps reached
+            if global_step >= max_steps:
+                break
+
+            # Prepare inputs
+            batch = prepare_model_inputs(batch, accelerator.device)
+
             # Forward pass
             with accelerator.accumulate(model):
                 outputs = model(**batch)
@@ -537,15 +565,24 @@ def run_training(config: TrainerConfig):
             # Log metrics
             if global_step % config.train_config["logging_steps"] == 0:
                 # Get learning rate
-                lr = scheduler.get_last_lr()[0]
-                
+                if scheduler:
+                    lr = scheduler.get_last_lr()[0]
+                else:
+                    # Handle case where scheduler might not be used (though unlikely with get_train_setup)
+                    lr = config.train_config["learning_rate"]
+
+                # Calculate approximate epoch for logging purposes if possible
+                approx_epoch = -1.0
+                if config.train_config.get("steps_per_epoch"):
+                    approx_epoch = global_step / config.train_config["steps_per_epoch"]
+
                 metrics = {
                     "train/loss": loss.item(),
                     "train/learning_rate": lr,
-                    "train/epoch": epoch + step / len(train_dataloader),
                     "train/global_step": global_step,
                 }
-                
+                if approx_epoch >= 0:
+                    metrics["train/approx_epoch"] = approx_epoch
                 # Add expert usage metrics if available
                 if expert_tracker is not None:
                     summary = expert_tracker.get_summary()
@@ -570,16 +607,16 @@ def run_training(config: TrainerConfig):
                         config.train_config["output_dir"],
                         f"checkpoint-{global_step}"
                     )
-                    
+
+                    # Save checkpoint - epoch is less meaningful here, pass global_step or 0
                     save_checkpoint(
                         accelerator.unwrap_model(model),
                         optimizer,
                         scheduler,
                         global_step,
-                        epoch,
+                        0, # Epoch is not tracked directly in this loop
                         checkpoint_path
                     )
-                    
                     # Save expert usage statistics if tracking is enabled
                     if expert_tracker is not None:
                         expert_stats_path = os.path.join(
@@ -609,11 +646,23 @@ def run_training(config: TrainerConfig):
                             for metric_name, value in result["metrics"].items():
                                 accelerator.log({
                                     f"eval/{eval_name}/{metric_name}": value,
-                                })
-                    
+                                }, step=global_step) # Log eval metrics at the correct step
+
                     # Set model back to train mode
                     model.train()
-    
+
+            # Check if max_steps reached within inner loop
+            if global_step >= max_steps:
+                break
+        # End of inner loop (dataloader iteration)
+
+        # Check again if max_steps reached after iterating through dataloader
+        if global_step >= max_steps:
+            break
+    # End of outer while loop
+
+    progress_bar.close()
+
     # Save final model
     if accelerator.is_main_process:
         logger.info("Training completed. Saving final model...")
@@ -627,11 +676,10 @@ def run_training(config: TrainerConfig):
             accelerator.unwrap_model(model),
             optimizer,
             scheduler,
-            global_step,
-            config.train_config["num_train_epochs"] - 1,
+            global_step, # Use final global_step
+            0, # Epoch is not tracked directly
             final_checkpoint_path
         )
-        
         # Save final expert usage statistics if tracking is enabled
         if expert_tracker is not None:
             expert_stats_path = os.path.join(
