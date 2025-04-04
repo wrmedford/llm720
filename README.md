@@ -206,8 +206,3 @@ python scripts/run_ablations.py --resume --output-dir ablation_results
 # Use custom dataset mixes
 python scripts/run_ablations.py --custom-datasets configs/datasets.yaml --output-dir ablation_results
 ```
-
-## References
-
-- PEER: "Mixture of A Million Experts" (2024)
-- MLA: DeepSeek model architecture
