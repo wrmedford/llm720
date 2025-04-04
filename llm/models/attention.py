@@ -16,6 +16,8 @@ from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata # Import get_mla_metadata
+from llm.models.foundation import update_paged_kv_cache # Import placeholder update function
 
 
 class MultiHeadedLatentAttention(nn.Module):
@@ -36,9 +38,11 @@ class MultiHeadedLatentAttention(nn.Module):
         v_head_dim: int = 128,
         qk_nope_head_dim: int = 128,
         dropout: float = 0.0,
+        layer_idx: int = None, # Add layer_idx
     ):
         super().__init__()
         self.hidden_size = hidden_size
+        self.layer_idx = layer_idx # Store layer_idx
         self.num_heads = num_heads
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -72,8 +76,7 @@ class MultiHeadedLatentAttention(nn.Module):
         # Output projection
         self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=False)
         
-        # Scaling factor for attention
-        self.scale = 1.0 / math.sqrt(self.q_head_dim)
+        # Scaling factor is handled internally by flash_mla_with_kvcache
     
     def _rotate_half(self, x):
         """Rotates half the hidden dims of the input."""
@@ -96,15 +99,34 @@ class MultiHeadedLatentAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
+        # KV cache arguments replace past_key_value, attention_mask is handled by causal flag or cache_seqlens
+        kv_cache: Optional[torch.Tensor] = None, # Shape: [num_blocks, 2, num_heads, block_size, head_dim]
+        block_table: Optional[torch.Tensor] = None, # Shape: [bsz, max_seq_len // block_size]
+        cache_seqlens: Optional[torch.Tensor] = None, # Shape: [bsz]
+        output_attentions: bool = False, # Note: FlashMLA does not return attention weights
+        # use_cache is implicit when kv_cache is provided
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """
+        Forward pass using FlashMLA.
+        
+        Args:
+            hidden_states: Input tensor.
+            position_ids: Position IDs for RoPE.
+            cos: Cosine tensor for RoPE.
+            sin: Sine tensor for RoPE.
+            kv_cache: Paged KV cache tensor.
+            block_table: Block table for Paged KV cache.
+            cache_seqlens: Sequence lengths for Paged KV cache.
+            output_attentions: Whether to output attentions (not supported by FlashMLA).
+            
+        Returns:
+            Tuple containing attention output, (None for attention weights), (None for past_key_value tuple).
+        """
         bsz, q_len, _ = hidden_states.shape
         
+        # --- Projections ---
         # Project queries
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
@@ -139,57 +161,64 @@ class MultiHeadedLatentAttention(nn.Module):
         
         key_states = torch.empty(bsz, self.num_heads, q_len, self.q_head_dim, device=hidden_states.device)
         key_states[..., :self.qk_nope_head_dim] = k_nope
-        key_states[..., self.qk_nope_head_dim:] = k_pe
+        key_states[..., self.qk_nope_head_dim:] = k_pe # Shape: (bsz, num_heads, q_len, q_head_dim)
+        # value_states shape: (bsz, num_heads, q_len, v_head_dim)
+
+        # --- Paged KV Cache Update ---
+        # Write current key/value to cache BEFORE attention computation
+        # This requires the actual implementation of update_paged_kv_cache
+        if kv_cache is not None and block_table is not None and cache_seqlens is not None:
+             update_paged_kv_cache(
+                 kv_cache=kv_cache,
+                 block_table=block_table,
+                 cache_seqlens=cache_seqlens,
+                 key=key_states,
+                 value=value_states,
+                 layer_idx=self.layer_idx
+             )
+
+        # --- FlashMLA Call ---
+        # Prepare query tensor in expected shape: (batch_size, seq_len_q, num_heads_q, head_dim)
+        # Current query_states shape: (bsz, num_heads, q_len, q_head_dim) -> transpose(1, 2)
+        q_for_flash = query_states.transpose(1, 2).contiguous() # Shape: (bsz, q_len, num_heads, q_head_dim)
+
+        # Get metadata for FlashMLA
+        # num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k = q_len * num_heads // num_heads = q_len
+        num_heads_per_head_k = q_len
+        num_heads_k = self.num_heads
+        tile_scheduler_metadata, num_splits = get_mla_metadata(
+            cache_seqlens=cache_seqlens,
+            num_heads_per_head_k=num_heads_per_head_k,
+            num_heads_k=num_heads_k,
+        )
+
+        # Call FlashMLA
+        # k_cache expects the *entire* cache, not just current keys
+        # Shape: (num_blocks, page_block_size, num_heads_k, head_dim) - assuming K only based on name
+        # Or potentially (num_blocks, 2, num_heads, block_size, head_dim) if K/V packed
+        attn_output_flash, _ = flash_mla_with_kvcache(
+            q=q_for_flash,
+            k_cache=kv_cache, # Pass the full cache tensor
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=self.v_head_dim,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            causal=True,
+            # softmax_scale is handled internally by default
+        )
+        # Output shape: (batch_size, seq_len_q, num_heads_q, head_dim_v)
+
+        # Reshape output back to (bsz, q_len, num_heads * v_head_dim)
+        attn_output = attn_output_flash.view(bsz, q_len, self.num_heads * self.v_head_dim)
+
+        # --- Output Projection ---
+        attn_output = self.o_proj(attn_output)
         
-        # Update keys and values if using cache
-        if past_key_value is not None:
-            # If past_key_value is provided, use it to augment the current key and value states
-            past_key, past_value = past_key_value
-            key_states = torch.cat([past_key, key_states], dim=-2)
-            value_states = torch.cat([past_value, value_states], dim=-2)
-        
-        kv_seq_len = key_states.shape[-2]
-        
-        # Calculate attention scores
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scale
-        
-        # Apply attention mask if provided
-        if attention_mask is not None:
-            # Ensure the mask has the right shape for broadcasting
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
-            elif attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            attn_weights = attn_weights + attention_mask
-        
-        # Apply causal mask
-        if past_key_value is None:
-            # If not using cached key-values, create a causal mask
-            causal_mask = torch.triu(
-                torch.ones((q_len, kv_seq_len), dtype=torch.bool, device=hidden_states.device), 
-                diagonal=1
-            )
-            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-        
-        # Apply softmax and dropout
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = F.dropout(attn_weights, p=self.dropout, training=self.training)
-        
-        # Calculate attention output
-        attn_output = torch.matmul(attn_weights, value_states)
-        
-        # Reshape and project back to hidden size
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
         
         # Prepare outputs
-        outputs = (attn_output,)
-        
-        if output_attentions:
-            outputs += (attn_weights,)
-        
-        if use_cache:
-            outputs += ((key_states, value_states),)
+        # FlashMLA does not return attention weights or the past_key_value tuple directly
+        outputs = (attn_output, None, None) # (attn_output, attn_weights, past_key_value)
         
         return outputs

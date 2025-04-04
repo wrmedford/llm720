@@ -24,6 +24,7 @@ setup(
         "seaborn>=0.12.0",
         "pandas>=1.3.0",
         "tabulate>=0.8.0",
+        "flash_mla",  # Add FlashMLA dependency
     ],
     extras_require={
         "dev": [

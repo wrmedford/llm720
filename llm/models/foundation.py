@@ -118,6 +118,7 @@ class TransformerBlock(nn.Module):
                 hidden_size=config.hidden_size,
                 num_heads=config.num_attention_heads,
                 dropout=config.attention_dropout,
+                layer_idx=layer_idx, # Pass layer_idx
                 **config.mla_config,
             )
         else:
@@ -151,12 +152,15 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states,
         position_ids,
-        attention_mask=None,
+        attention_mask: Optional[torch.Tensor] = None, # Add attention_mask back
         cos=None,
         sin=None,
-        past_key_value=None,
+        # Paged KV cache arguments
+        kv_cache=None,
+        block_table=None,
+        cache_seqlens=None,
         output_attentions=False,
-        use_cache=False,
+        # use_cache is implicit
     ):
         residual = hidden_states
         
@@ -167,24 +171,33 @@ class TransformerBlock(nn.Module):
             attention_outputs = self.attention(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
-                attention_mask=attention_mask,
+                # Removed duplicate hidden_states and position_ids arguments
                 cos=cos,
                 sin=sin,
-                past_key_value=past_key_value,
+                kv_cache=kv_cache, # Pass Paged KV cache parts for the current layer
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
                 output_attentions=output_attentions,
-                use_cache=use_cache,
+                # layer_idx is implicitly passed via self.attention instance
             )
+            # Output signature: (attn_output, attn_weights, past_key_value)
+            # FlashMLA returns (attn_output, None, None)
             attn_output = attention_outputs[0]
+            attn_weights = attention_outputs[1] # Will be None
             
             # Add outputs depending on configuration
             outputs = (attn_output,)
             if output_attentions:
-                outputs += (attention_outputs[1],)  # attention weights
-            if use_cache:
-                outputs += (attention_outputs[2],)  # past_key_value
+                 # FlashMLA doesn't return weights, append None or handle differently
+                outputs += (attn_weights,) # Appending None
+            # Cache is managed externally via kv_cache, block_table, cache_seqlens
+            # No past_key_value tuple is returned by the attention layer anymore
         else:
+            # Standard attention path - needs similar cache handling update if MLA is disabled
+            # For simplicity, assuming use_mla=True is the primary path
             # Convert attention mask from [batch_size, seq_len] to attention format
-            if attention_mask is not None:
+            # Note: FlashAttention/FlashMLA typically handle causal masking internally
+            if attention_mask is not None: # This mask might still be needed for padding
                 # Convert to float and invert (1->0, 0->-inf)
                 attn_mask = (1.0 - attention_mask.unsqueeze(1)) * -10000.0
             else:
@@ -192,15 +205,15 @@ class TransformerBlock(nn.Module):
             
             attn_output, attn_weights = self.attention(
                 hidden_states, hidden_states, hidden_states,
-                attn_mask=attn_mask,
+                attn_mask=attn_mask, # May need adjustment for standard attention with Paged KV
                 need_weights=output_attentions,
+                # Add cache arguments here if modifying standard attention
             )
             
             outputs = (attn_output,)
             if output_attentions:
                 outputs += (attn_weights,)
-            if use_cache:
-                outputs += (None,)  # Placeholder for past_key_value
+            # No past_key_value tuple returned
         
         # Residual connection
         hidden_states = residual + self.dropout(outputs[0])
@@ -211,7 +224,73 @@ class TransformerBlock(nn.Module):
         hidden_states = self.feed_forward(hidden_states)
         hidden_states = residual + hidden_states
         
+        # Return signature adjusted: (hidden_states, attn_weights [None])
         return (hidden_states,) + outputs[1:]
+
+
+# Placeholder for Paged KV Cache management logic
+# Needs actual implementation based on chosen library/approach (e.g., vLLM's PagedAttention)
+
+# Expected cache shapes based on FlashMLA interface (assuming block_size=64):
+# k_cache: (num_blocks, 64, num_heads, k_head_dim)
+# v_cache: (num_blocks, 64, num_heads, v_head_dim)
+# OR potentially packed: kv_cache: (num_blocks, 2, 64, num_heads, head_dim) - Needs clarification!
+
+def init_paged_kv_cache(config, batch_size, max_seq_len, device):
+    """
+    Initializes the Paged KV Cache tensors.
+    This needs a concrete implementation based on the chosen PagedAttention library or logic.
+    It should allocate the cache tensors (k_cache, v_cache or packed kv_cache) and
+    the initial block_table and cache_seqlens.
+    """
+    print("Warning: Paged KV Cache initialization logic (init_paged_kv_cache) is a placeholder.")
+    # Example placeholder dimensions (adjust based on actual cache structure)
+    num_layers = config.num_hidden_layers
+    num_heads = config.num_attention_heads
+    # Assuming k_head_dim = q_head_dim from MLA config
+    k_head_dim = config.mla_config.get("qk_nope_head_dim", 128) + config.mla_config.get("qk_rope_head_dim", 64)
+    v_head_dim = config.mla_config.get("v_head_dim", 128)
+    block_size = 64 # From FlashMLA README
+    # num_blocks needs estimation based on max_seq_len, batch_size, and available memory
+    num_blocks = 2048 # Example placeholder
+
+    # Placeholder cache tensors (replace with actual allocation)
+    # Assuming separate K and V caches for now based on flash_mla_cuda.fwd_kvcache_mla signature
+    k_cache = torch.zeros((num_blocks, block_size, num_heads, k_head_dim), dtype=torch.float16, device=device)
+    v_cache = torch.zeros((num_blocks, block_size, num_heads, v_head_dim), dtype=torch.float16, device=device)
+    # Placeholder block table and sequence lengths
+    max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
+    block_table = torch.zeros((batch_size, max_num_blocks_per_seq), dtype=torch.int32, device=device)
+    cache_seqlens = torch.zeros((batch_size,), dtype=torch.int32, device=device)
+
+    # Return k_cache, v_cache, block_table, cache_seqlens (adjust if packed)
+    # For now, returning a single kv_cache placeholder to match previous structure
+    # This needs to be adapted based on how flash_mla_with_kvcache expects it.
+    # If it expects separate K/V, the call signature in attention.py needs changing.
+    # Assuming it expects a packed structure or just K for now.
+    packed_kv_cache_placeholder = k_cache # Use k_cache as placeholder for the single cache tensor
+
+    return packed_kv_cache_placeholder, block_table, cache_seqlens
+
+
+def update_paged_kv_cache(kv_cache, block_table, cache_seqlens, key, value, layer_idx):
+    """
+    Writes the current key and value tensors into the Paged KV cache.
+    This needs a concrete implementation using the block_table to find the
+    correct physical blocks and offsets based on cache_seqlens.
+    The layer_idx might be needed if the cache tensor includes the layer dimension.
+    """
+    # key shape: (bsz, num_heads, q_len, k_head_dim)
+    # value shape: (bsz, num_heads, q_len, v_head_dim)
+    # kv_cache shape: (num_blocks, block_size, num_heads, k_head_dim) - Assuming K only for now
+    # block_table shape: (bsz, max_num_blocks_per_seq)
+    # cache_seqlens shape: (bsz,)
+    print(f"Warning: Paged KV Cache update logic (update_paged_kv_cache) for layer {layer_idx} is a placeholder.")
+    # --- Implementation needed here ---
+    # Example steps:
+    # 1. Determine target block indices and offsets using block_table and cache_seqlens.
+    # 2. Reshape/scatter the key and value tensors into the kv_cache tensor at the calculated positions.
+    pass
 
 
 class FoundationModel(nn.Module):
@@ -277,18 +356,52 @@ class FoundationModel(nn.Module):
         output_hidden_states=False,
         return_dict=True,
     ):
+        # Determine batch size and sequence length
+        if input_ids is not None:
+            batch_size, seq_length = input_ids.shape
+            device = input_ids.device
+        elif inputs_embeds is not None:
+            batch_size, seq_length = inputs_embeds.shape[:2]
+            device = inputs_embeds.device
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided.")
+
+        # Initialize Paged KV Cache if use_cache is True and cache is not provided
+        # This logic depends heavily on how generation is handled externally
+        is_decode_phase = past_key_values is not None # Use past_key_values presence to infer phase
+        if use_cache:
+             if is_decode_phase:
+                 # Assume past_key_values now contains the necessary cache structures
+                 # Adjust unpacking based on what init_paged_kv_cache returns
+                 kv_cache, block_table, cache_seqlens = past_key_values # Assuming single cache tensor for now
+             else: # Prefill phase
+                 # Initialize Paged KV Cache structure
+                 # max_length needs to be determined (e.g., from config or generation params)
+                 max_length = self.config.max_position_embeddings # Example
+                 kv_cache, block_table, cache_seqlens = init_paged_kv_cache(
+                     self.config, batch_size, max_length, device
+                 )
+                 # Prefill phase uses full seq_length
+                 # Decode phase uses seq_length=1, cache_seqlens tracks actual lengths
+        else:
+            kv_cache, block_table, cache_seqlens = None, None, None
+
         # Initialize return values
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-        next_decoder_cache = () if use_cache else None
-        
-        batch_size, seq_length = input_ids.shape if input_ids is not None else inputs_embeds.shape[:2]
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
-        
+        # next_decoder_cache tuple is replaced by the updated Paged KV cache structures
+
         # Generate default position IDs if not provided
+        # Handle position_ids based on prefill/decode phase if using cache
         if position_ids is None:
-            position_ids = torch.arange(seq_length, dtype=torch.long, device=device).unsqueeze(0)
-        
+             if is_decode_phase:
+                 # Decode phase: position is the current total length
+                 current_length = cache_seqlens[0].item() # Assuming uniform length for simplicity
+                 position_ids = torch.tensor([[current_length]], dtype=torch.long, device=device)
+                 seq_length = 1 # Decode phase processes one token at a time
+             else: # Prefill phase
+                 position_ids = torch.arange(seq_length, dtype=torch.long, device=device).unsqueeze(0)
+
         # Get embeddings
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
@@ -307,27 +420,34 @@ class FoundationModel(nn.Module):
         for i, block in enumerate(self.blocks):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
-            
-            past_key_value = past_key_values[i] if past_key_values is not None else None
+
+            # Get the Paged KV cache specific to the layer if needed, or pass the whole structure
+            # Assuming the block expects the full cache structure to manage internally or via the attention layer
             
             layer_outputs = block(
                 hidden_states,
                 position_ids=position_ids,
-                attention_mask=attention_mask,
+                # attention_mask might still be needed for padding in prefill, but causal handled by FlashMLA
                 cos=cos,
                 sin=sin,
-                past_key_value=past_key_value,
+                kv_cache=kv_cache, # Pass cache structures
+                block_table=block_table,
+                cache_seqlens=cache_seqlens,
                 output_attentions=output_attentions,
-                use_cache=use_cache,
             )
             
             hidden_states = layer_outputs[0]
             
+            # Update cache_seqlens after first layer in decode phase
+            # This logic needs careful placement depending on cache update strategy
+            if use_cache and is_decode_phase and i == 0:
+                 cache_seqlens += 1
+
             if output_attentions:
+                # layer_outputs[1] will be None from FlashMLA
                 all_self_attns = all_self_attns + (layer_outputs[1],)
             
-            if use_cache:
-                next_decoder_cache = next_decoder_cache + (layer_outputs[2 if output_attentions else 1],)
+            # Cache is managed via passed structures, no tuple to collect
         
         # Final layer norm
         hidden_states = self.ln_f(hidden_states)
@@ -351,17 +471,23 @@ class FoundationModel(nn.Module):
         
         # Prepare outputs
         if return_dict:
-            return {
-                "loss": loss,
-                "logits": lm_logits,
-                "past_key_values": next_decoder_cache,
-                "hidden_states": all_hidden_states,
-                "attentions": all_self_attns,
-            }
+             output_dict = {
+                 "loss": loss,
+                 "logits": lm_logits,
+                 "hidden_states": all_hidden_states,
+                 "attentions": all_self_attns, # Will contain Nones if output_attentions=True
+             }
+             if use_cache:
+                 # Return the updated cache structures
+                 # Adjust packing based on what needs to be passed back
+                 output_dict["past_key_values"] = (kv_cache, block_table, cache_seqlens) # Assuming single cache tensor
+             return output_dict
         else:
             outputs = (lm_logits,)
             if use_cache:
-                outputs = outputs + (next_decoder_cache,)
+                 # Return updated cache structures
+                 # Adjust packing based on what needs to be passed back
+                 outputs = outputs + ((kv_cache, block_table, cache_seqlens),) # Assuming single cache tensor
             if output_hidden_states:
                 outputs = outputs + (all_hidden_states,)
             if output_attentions:
