@@ -1,0 +1,89 @@
+model_config:
+  # Architecture
+  hidden_size: 768
+  num_hidden_layers: 12
+  num_attention_heads: 12
+  intermediate_size: 3072
+
+  # PEER configuration
+  use_peer: true
+  peer_config:
+    num_experts: 1048576  # 1024^2 experts (default)
+    num_experts_per_tok: 16
+    num_heads: 8
+    expert_hidden_size: 1  # Single neuron experts
+    product_key_dim: [1024, 1024]  # Cartesian product dimensions
+    query_dim: 256
+    batch_norm_query: true
+    log_expert_usage: true  # Enable logging of expert usage patterns
+    log_freq: 1000  # Log expert usage every N steps
+    usage_threshold: 5.0  # Flag experts with usage > threshold * average as "hot"
+
+  # MLA configuration
+  use_mla: true
+  mla_config:
+    q_lora_rank: 1536
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+    v_head_dim: 128
+    qk_nope_head_dim: 128
+
+train_config:
+  output_dir: "./output"
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 4
+  learning_rate: 5e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  num_train_epochs: 3
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  log_level: "info"
+  logging_steps: 100
+  save_steps: 1000
+  eval_steps: 2000
+  seed: 42
+  fp16: true
+  bf16: false
+  tf32: false
+  resume_from_checkpoint: null
+
+dataset_config:
+  datasets:
+    - name: "pile"
+      path: "EleutherAI/pile"
+      split: "train"
+      streaming: true
+      weight: 0.7
+      text_field: "text"
+    - name: "c4"
+      path: "allenai/c4"
+      split: "train"
+      streaming: true
+      weight: 0.2
+      text_field: "text"
+    - name: "code_alpaca"
+      path: "sahil2801/CodeAlpaca-20k"
+      split: "train"
+      streaming: true
+      weight: 0.1
+      text_field: "instruction"
+  tokenizer_name: "gpt2"
+  max_seq_length: 2048
+
+eval_config:
+  evals_registry_path: "./evals/registry"
+  evals:
+    - "hellaswag"
+    - "mmlu"
+    - "truthfulqa"
+    - "gsm8k"
+    - "humaneval"
+  eval_batch_size: 16
+
+wandb_config:
+  project: "foundation-model-training"
+  entity: "your-wandb-entity"
+  name: "lm-training-peer-mla"
+  log_model: "all"

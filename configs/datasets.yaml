@@ -1,0 +1,103 @@
+# Custom Dataset Configuration for Ablation Testing
+
+# This file allows you to define your own dataset mixes for ablation testing
+# You can either modify this file directly or create a new one with similar structure
+
+data_mixes:
+  # High-quality mix replacing standard datasets
+  high_quality_mix:
+    name: "high_quality_mix"
+    datasets:
+      # Replace these with your actual high-quality datasets
+      - name: "custom_dataset_1"
+        path: "/path/to/your/dataset_1"  # Can be local path or HF dataset name
+        split: "train"
+        streaming: true
+        weight: 0.4
+        text_field: "text"
+      
+      - name: "custom_dataset_2"
+        path: "/path/to/your/dataset_2"
+        split: "train"
+        streaming: true
+        weight: 0.3
+        text_field: "text"
+      
+      - name: "custom_dataset_3"
+        path: "/path/to/your/dataset_3"
+        split: "train"
+        streaming: true
+        weight: 0.2
+        text_field: "text"
+      
+      # You might still want to keep some coding datasets
+      - name: "code_alpaca"
+        path: "sahil2801/CodeAlpaca-20k"
+        split: "train"
+        streaming: true
+        weight: 0.1
+        text_field: "instruction"
+  
+  # Science-focused mix
+  science_mix:
+    name: "science_mix"
+    datasets:
+      - name: "custom_science_dataset"
+        path: "/path/to/science_dataset"
+        split: "train"
+        streaming: true
+        weight: 0.4
+        text_field: "text"
+      
+      - name: "math_dataset"
+        path: "meta-math/MetaMathQA"
+        split: "train"
+        streaming: true
+        weight: 0.3
+        text_field: "text"
+      
+      - name: "code_dataset"
+        path: "bigcode/starcoderdata"
+        split: "train"
+        streaming: true
+        weight: 0.2
+        text_field: "text"
+      
+      - name: "general_knowledge"
+        path: "/path/to/general_knowledge_dataset"
+        split: "train"
+        streaming: true
+        weight: 0.1
+        text_field: "text"
+  
+  # Code-heavy mix with custom datasets
+  code_expert_mix:
+    name: "code_expert_mix"
+    datasets:
+      - name: "custom_code_dataset"
+        path: "/path/to/code_dataset"
+        split: "train"
+        streaming: true
+        weight: 0.5
+        text_field: "code"
+      
+      - name: "starcoder"
+        path: "bigcode/starcoderdata"
+        split: "train"
+        streaming: true
+        weight: 0.2
+        text_field: "text"
+      
+      - name: "code_alpaca"
+        path: "sahil2801/CodeAlpaca-20k"
+        split: "train"
+        streaming: true
+        weight: 0.2
+        text_field: "instruction"
+      
+      - name: "custom_base_dataset"
+        path: "/path/to/base_dataset"
+        split: "train"
+        streaming: true
+        weight: 0.1
+        text_field: "text"
