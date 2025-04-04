@@ -1,0 +1,9 @@
+[submodule "FlashMLA"]
+	path = FlashMLA
+	url = https://github.com/deepseek-ai/FlashMLA.git
+[submodule "DeepSeek/DeepGEMM"]
+	path = DeepSeek/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+[submodule "DeepSeek/FlashMLA"]
+	path = DeepSeek/FlashMLA
+	url = https://github.com/deepseek-ai/FlashMLA.git
