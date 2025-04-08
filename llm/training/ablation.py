@@ -26,35 +26,48 @@ import seaborn as sns
 import yaml
 
 # Define ablation configuration spaces for each axis
+# Calculated expert_hidden_size for 228KB FP8 experts with hidden_size=768
+EXPERT_HIDDEN_SIZE_CALC = 152
+
 ABLATION_CONFIGS = {
     # 1. Initial data mix ablations
     "data_mix": [
         {
-            "name": "baseline",
+            "name": "web_heavy",
             "datasets": [
                 {
-                    "name": "pile",
-                    "path": "EleutherAI/pile",
+                    "name": "fineweb",
+                    "path": "HuggingFaceFW/fineweb",
+                    "name": "sample/10BT", # Specify subset for FineWeb
                     "split": "train",
                     "streaming": True,
-                    "weight": 0.7,
+                    "weight": 0.6,
                     "text_field": "text",
                 },
                 {
-                    "name": "c4",
-                    "path": "allenai/c4",
+                    "name": "wikipedia",
+                    "path": "wikimedia/wikipedia",
+                    "name": "20231101.en", # Specify Wikipedia dump version
                     "split": "train",
                     "streaming": True,
                     "weight": 0.2,
                     "text_field": "text",
                 },
                 {
-                    "name": "code_alpaca",
-                    "path": "sahil2801/CodeAlpaca-20k",
+                    "name": "github_code",
+                    "path": "codeparrot/github-code",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.1,
-                    "text_field": "instruction",
+                    "text_field": "code",
+                },
+                {
+                    "name": "openr1_math",
+                    "path": "open-r1/OpenR1-Math-220k",
+                    "split": "train",
+                    "streaming": True,
+                    "weight": 0.1,
+                    "text_field": "problem",
                 },
             ],
         },
@@ -62,65 +75,77 @@ ABLATION_CONFIGS = {
             "name": "code_heavy",
             "datasets": [
                 {
-                    "name": "pile",
-                    "path": "EleutherAI/pile",
+                    "name": "fineweb",
+                    "path": "HuggingFaceFW/fineweb",
+                    "name": "sample/10BT",
+                    "split": "train",
+                    "streaming": True,
+                    "weight": 0.3,
+                    "text_field": "text",
+                },
+                {
+                    "name": "github_code",
+                    "path": "codeparrot/github-code",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.4,
-                    "text_field": "text",
+                    "text_field": "code",
                 },
                 {
-                    "name": "c4",
-                    "path": "allenai/c4",
+                    "name": "opencode_reasoning",
+                    "path": "nvidia/OpenCodeReasoning",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.2,
-                    "text_field": "text",
+                    "text_field": "input",
                 },
-                {
-                    "name": "code_alpaca",
-                    "path": "sahil2801/CodeAlpaca-20k",
+                 {
+                    "name": "wikipedia",
+                    "path": "wikimedia/wikipedia",
+                    "name": "20231101.en",
                     "split": "train",
                     "streaming": True,
-                    "weight": 0.2,
-                    "text_field": "instruction",
-                },
-                {
-                    "name": "starcoder",
-                    "path": "bigcode/starcoderdata",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.2,
+                    "weight": 0.1,
                     "text_field": "text",
                 },
             ],
         },
         {
-            "name": "web_heavy",
+            "name": "math_heavy",
             "datasets": [
                 {
-                    "name": "pile",
-                    "path": "EleutherAI/pile",
+                    "name": "fineweb",
+                    "path": "HuggingFaceFW/fineweb",
+                    "name": "sample/10BT",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.4,
                     "text_field": "text",
                 },
                 {
-                    "name": "c4",
-                    "path": "allenai/c4",
+                    "name": "openr1_math",
+                    "path": "open-r1/OpenR1-Math-220k",
                     "split": "train",
                     "streaming": True,
-                    "weight": 0.5,
-                    "text_field": "text",
+                    "weight": 0.4,
+                    "text_field": "problem",
                 },
                 {
-                    "name": "code_alpaca",
-                    "path": "sahil2801/CodeAlpaca-20k",
+                    "name": "wikipedia",
+                    "path": "wikimedia/wikipedia",
+                    "name": "20231101.en",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.1,
-                    "text_field": "instruction",
+                    "text_field": "text",
+                },
+                {
+                    "name": "github_code",
+                    "path": "codeparrot/github-code",
+                    "split": "train",
+                    "streaming": True,
+                    "weight": 0.1,
+                    "text_field": "code",
                 },
             ],
         },
@@ -128,134 +153,69 @@ ABLATION_CONFIGS = {
             "name": "balanced",
             "datasets": [
                 {
-                    "name": "pile",
-                    "path": "EleutherAI/pile",
+                    "name": "fineweb",
+                    "path": "HuggingFaceFW/fineweb",
+                    "name": "sample/10BT",
                     "split": "train",
                     "streaming": True,
-                    "weight": 0.33,
+                    "weight": 0.4,
                     "text_field": "text",
                 },
                 {
-                    "name": "c4",
-                    "path": "allenai/c4",
+                    "name": "github_code",
+                    "path": "codeparrot/github-code",
                     "split": "train",
                     "streaming": True,
-                    "weight": 0.33,
-                    "text_field": "text",
+                    "weight": 0.25,
+                    "text_field": "code",
                 },
                 {
-                    "name": "code_alpaca",
-                    "path": "sahil2801/CodeAlpaca-20k",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.34,
-                    "text_field": "instruction",
-                },
-            ],
-        },
-        {
-            "name": "domain_specific",
-            "datasets": [
-                {
-                    "name": "pile",
-                    "path": "EleutherAI/pile",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.5,
-                    "text_field": "text",
-                },
-                {
-                    "name": "c4",
-                    "path": "allenai/c4",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.15,
-                    "text_field": "text",
-                },
-                {
-                    "name": "code_alpaca",
-                    "path": "sahil2801/CodeAlpaca-20k",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.15,
-                    "text_field": "instruction",
-                },
-                {
-                    "name": "math",
-                    "path": "meta-math/MetaMathQA",
+                    "name": "openr1_math",
+                    "path": "open-r1/OpenR1-Math-220k",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.2,
+                    "text_field": "problem",
+                },
+                {
+                    "name": "wikipedia",
+                    "path": "wikimedia/wikipedia",
+                    "name": "20231101.en",
+                    "split": "train",
+                    "streaming": True,
+                    "weight": 0.15,
                     "text_field": "text",
                 },
             ],
         },
     ],
-    # 2. Number of experts and size of experts
-    "expert_count": [
+    # 2. Expert setup (combining count, dimensions, and size)
+    "expert_setup": [
         {
-            "name": "many_tiny",
-            "num_experts": 1048576,  # 1024 x 1024
-            "product_key_dim": [1024, 1024],
-            "expert_hidden_size": 1,
-        },
-        {
-            "name": "medium",
-            "num_experts": 262144,  # 512 x 512
-            "product_key_dim": [512, 512],
-            "expert_hidden_size": 4,
-        },
-        {
-            "name": "fewer_larger",
-            "num_experts": 65536,  # 256 x 256
-            "product_key_dim": [256, 256],
-            "expert_hidden_size": 16,
-        },
-        {
-            "name": "traditional_moe",
-            "num_experts": 16384,  # 128 x 128
-            "product_key_dim": [128, 128],
-            "expert_hidden_size": 64,
-        },
-    ],
-    # 3. Dimensionality of cartesian product
-    "cartesian_dims": [
-        {
-            "name": "2d_balanced",
+            "name": "2d_1M_152h",
             "num_experts": 1048576,
             "product_key_dim": [1024, 1024],
+            "expert_hidden_size": EXPERT_HIDDEN_SIZE_CALC,
         },
         {
-            "name": "3d_balanced",
-            "num_experts": 1000000,
+            "name": "3d_1M_152h",
+            "num_experts": 1000000, # Note: 100^3 = 1,000,000
             "product_key_dim": [100, 100, 100],
+            "expert_hidden_size": EXPERT_HIDDEN_SIZE_CALC,
         },
         {
-            "name": "4d_balanced",
-            "num_experts": 1048576,
+            "name": "4d_1M_152h",
+            "num_experts": 1048576, # Note: 32^4 = 1,048,576
             "product_key_dim": [32, 32, 32, 32],
-        },
-        {
-            "name": "asymmetric_2d",
-            "num_experts": 1048576,
-            "product_key_dim": [4096, 256],
-        },
-        {
-            "name": "very_asymmetric",
-            "num_experts": 1048576,
-            "product_key_dim": [65536, 16],
+            "expert_hidden_size": EXPERT_HIDDEN_SIZE_CALC,
         },
     ],
-    # 4. Number of expert selection heads
+    # 3. Number of expert selection heads and experts per token
     "selection_heads": [
-        {"name": "few_heads_many_experts", "num_heads": 4, "num_experts_per_tok": 32},
-        {"name": "balanced", "num_heads": 8, "num_experts_per_tok": 16},
-        {"name": "many_heads_few_experts", "num_heads": 16, "num_experts_per_tok": 8},
-        {
-            "name": "many_heads_very_few_experts",
-            "num_heads": 32,
-            "num_experts_per_tok": 4,
-        },
+        {"name": "h4_k32", "num_heads": 4, "num_experts_per_tok": 32},
+        {"name": "h8_k16", "num_heads": 8, "num_experts_per_tok": 16},
+        {"name": "h16_k8", "num_heads": 16, "num_experts_per_tok": 8},
+        {"name": "h32_k4", "num_heads": 32, "num_experts_per_tok": 4},
     ],
 }
 
@@ -299,32 +259,21 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str) ->
         config["dataset_config"]["datasets"] = data_mix["datasets"]
         experiment_name_parts.append(f"data-{data_mix['name']}")
 
-    # 2. Apply expert count configuration if present
-    if "expert_count" in experiment:
-        expert_count = experiment["expert_count"]
-        config["model_config"]["peer_config"]["num_experts"] = expert_count[
+    # 2. Apply expert setup configuration if present
+    if "expert_setup" in experiment:
+        expert_setup = experiment["expert_setup"]
+        config["model_config"]["peer_config"]["num_experts"] = expert_setup[
             "num_experts"
         ]
-        config["model_config"]["peer_config"]["product_key_dim"] = expert_count[
+        config["model_config"]["peer_config"]["product_key_dim"] = expert_setup[
             "product_key_dim"
         ]
-        config["model_config"]["peer_config"]["expert_hidden_size"] = expert_count[
+        config["model_config"]["peer_config"]["expert_hidden_size"] = expert_setup[
             "expert_hidden_size"
         ]
-        experiment_name_parts.append(f"experts-{expert_count['name']}")
+        experiment_name_parts.append(f"expert-{expert_setup['name']}")
 
-    # 3. Apply cartesian dimensions configuration if present
-    if "cartesian_dims" in experiment:
-        cartesian_dims = experiment["cartesian_dims"]
-        config["model_config"]["peer_config"]["num_experts"] = cartesian_dims[
-            "num_experts"
-        ]
-        config["model_config"]["peer_config"]["product_key_dim"] = cartesian_dims[
-            "product_key_dim"
-        ]
-        experiment_name_parts.append(f"dims-{cartesian_dims['name']}")
-
-    # 4. Apply selection heads configuration if present
+    # 3. Apply selection heads configuration if present
     if "selection_heads" in experiment:
         selection_heads = experiment["selection_heads"]
         config["model_config"]["peer_config"]["num_heads"] = selection_heads[
@@ -822,13 +771,16 @@ def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
         data=df,
         x="total_params",
         y="perplexity",
-        hue="experiment_type",
+        data=df,
+        x="total_params",
+        y="perplexity",
+        hue="experiment_type", # Color by the combination of axes tested
         size="active_params_ratio",
         sizes=(100, 400),
         alpha=0.7,
     )
     plt.xscale("log")
-    plt.title("Model Size vs. Perplexity for Different Configurations")
+    plt.title("Total Parameters vs. Perplexity")
     plt.xlabel("Total Parameters")
     plt.ylabel("Perplexity (lower is better)")
     plt.savefig(os.path.join(viz_dir, "params_vs_perplexity.png"))
@@ -841,11 +793,11 @@ def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
         x="active_params_ratio",
         y="perplexity",
         hue="experiment_type",
-        style="dims_config" if "dims_config" in df else None,
+        style="expert_setup_config" if "expert_setup_config" in df else None, # Style by expert setup
         s=150,
         alpha=0.8,
     )
-    plt.title("Expert Activation Ratio vs. Perplexity")
+    plt.title("Active Parameter Ratio vs. Perplexity")
     plt.xlabel("Active Parameters Ratio")
     plt.ylabel("Perplexity (lower is better)")
     plt.savefig(os.path.join(viz_dir, "active_ratio_vs_perplexity.png"))
@@ -861,13 +813,14 @@ def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
         if benchmark not in df.columns or df[benchmark].isna().all():
             continue
 
-        # Create visualization for this benchmark
+        # Create visualization for this benchmark vs Total Params
         plt.figure(figsize=(12, 8))
         sns.scatterplot(
             data=df,
             x="total_params",
             y=benchmark,
             hue="experiment_type",
+            style="expert_setup_config" if "expert_setup_config" in df else None,
             size="active_params_ratio",
             sizes=(100, 400),
             alpha=0.7,
@@ -889,42 +842,43 @@ def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
         plt.title(f"Model Size vs. {benchmark.replace('_', ' ').title()}")
         plt.xlabel("Total Parameters")
         plt.ylabel(f"{benchmark.replace('_', ' ').title()}{ylabel_suffix}")
-        plt.savefig(os.path.join(viz_dir, f"params_vs_{benchmark}.png"))
+        plt.savefig(os.path.join(viz_dir, f"total_params_vs_{benchmark}.png"))
         plt.close()
 
-        # Create comparison by expert configuration if applicable
-        if "expert_config" in df.columns:
-            plt.figure(figsize=(15, 10))
+        # Create visualization for this benchmark vs Active Params Ratio
+        plt.figure(figsize=(12, 8))
+        sns.scatterplot(
+            data=df,
+            x="active_params_ratio",
+            y=benchmark,
+            hue="experiment_type",
+            style="expert_setup_config" if "expert_setup_config" in df else None,
+            s=150,
+            alpha=0.8,
+        )
+        plt.title(f"Active Parameter Ratio vs. {benchmark.replace('_', ' ').title()}")
+        plt.xlabel("Active Parameters Ratio")
+        plt.ylabel(f"{benchmark.replace('_', ' ').title()}{ylabel_suffix}")
+        plt.savefig(os.path.join(viz_dir, f"active_ratio_vs_{benchmark}.png"))
+        plt.close()
 
-            # Filter out NaN values
-            plot_data = df[df[benchmark].notna()].copy()
 
-            if len(plot_data) < 2:
-                continue
+        # Create comparison bar plot by experiment name
+        plt.figure(figsize=(max(15, len(df) * 0.5), 8)) # Adjust width based on number of experiments
+        plot_data = df[df[benchmark].notna()].copy()
+        if len(plot_data) < 1:
+            continue
 
-            # Sort by benchmark score - different direction depending on metric
-            if benchmark in [
-                "aime_2024",
-                "codeforces",
-                "gpqa_diamond",
-                "math_500",
-                "mmlu",
-                "swe_bench",
-            ]:
-                # Higher is better
-                plot_data = plot_data.sort_values(benchmark, ascending=False)
-            else:
-                # Lower is better (perplexity)
-                plot_data = plot_data.sort_values(benchmark)
+        # Sort by benchmark score
+        higher_is_better = benchmark != "perplexity"
+        plot_data = plot_data.sort_values(benchmark, ascending=not higher_is_better)
 
-            # Create bar plot
-            plt.figure(figsize=(14, 8))
-            sns.barplot(data=plot_data, x="experiment_name", y=benchmark)
-            plt.xticks(rotation=90)
-            plt.title(f"{benchmark.replace('_', ' ').title()} by Configuration")
-            plt.tight_layout()
-            plt.savefig(os.path.join(viz_dir, f"{benchmark}_by_config.png"))
-            plt.close()
+        sns.barplot(data=plot_data, x="experiment_name", y=benchmark, hue="experiment_type", dodge=False)
+        plt.xticks(rotation=90)
+        plt.title(f"{benchmark.replace('_', ' ').title()} by Experiment")
+        plt.tight_layout()
+        plt.savefig(os.path.join(viz_dir, f"{benchmark}_by_experiment.png"))
+        plt.close()
 
 
 def calculate_normalized_scores(
@@ -1097,23 +1051,23 @@ def run_ablation_study(
             "active_params_ratio": eval_results.get("active_params", 0)
             / max(eval_results.get("total_params", 1), 1),
             "training_time": training_time,
-            "experiment_type": "_".join([axis for axis in experiment.keys()]),
+            "experiment_type": "_".join(sorted([axis for axis in experiment.keys()])), # Sort axes for consistency
         }
 
-        # Add specific configuration details
+        # Add specific configuration details and benchmark results
         for axis, config in experiment.items():
             if axis == "data_mix":
                 result["data_config"] = config["name"]
-            elif axis == "expert_count":
-                result[
-                    "expert_config"
-                ] = f"{config['num_experts']}x{config['expert_hidden_size']}"
-            elif axis == "cartesian_dims":
-                result["dims_config"] = "x".join(map(str, config["product_key_dim"]))
+            elif axis == "expert_setup":
+                result["expert_setup_config"] = config["name"]
             elif axis == "selection_heads":
-                result[
-                    "selection_config"
-                ] = f"{config['num_heads']}x{config['num_experts_per_tok']}"
+                result["selection_config"] = config["name"]
+
+        # Add benchmark results directly from eval_results
+        for key, value in eval_results.items():
+            if key not in ["experiment_name", "checkpoint_path", "config_path", "timestamp", "total_params", "active_params"]:
+                result[key] = value
+
 
         # Add result to list
         results_list.append(result)

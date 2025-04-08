@@ -83,7 +83,7 @@ eval_config:
   eval_batch_size: 16
 
 wandb_config:
-  project: "foundation-model-training"
-  entity: "your-wandb-entity"
-  name: "lm-training-peer-mla"
-  log_model: "all"
+  project: "llm"
+  entity: "wryanmedford"
+  name: "lm-training-peer-mla" # This will be overridden by ablation script
+  log_model: "checkpoints" # Log only checkpoints to save space/time, or 'all'
