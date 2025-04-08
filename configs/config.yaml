@@ -19,8 +19,7 @@ model_config:
     log_freq: 1000  # Log expert usage every N steps
     usage_threshold: 5.0  # Flag experts with usage > threshold * average as "hot"
 
-  # MLA configuration
-  use_mla: true
+  # MLA configuration (MLA is always used)
   mla_config:
     q_lora_rank: 1536
     kv_lora_rank: 512

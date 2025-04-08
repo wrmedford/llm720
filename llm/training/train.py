@@ -67,8 +67,7 @@ class TrainerConfig:
                 "query_dim": 256,
                 "batch_norm_query": True,
             },
-            # MLA configuration
-            "use_mla": True,
+            # MLA configuration (MLA is always used)
             "mla_config": {
                 "q_lora_rank": 1536,
                 "kv_lora_rank": 512,

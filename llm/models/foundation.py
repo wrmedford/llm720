@@ -78,7 +78,7 @@ class TransformerConfig:
         layer_norm_eps=1e-5,
         use_peer=True,
         peer_config=None,
-        use_mla=True,
+        # use_mla=True, # MLA is now always used
         mla_config=None,
         vocab_size=50257,  # GPT-2 vocab size
     ):
@@ -94,13 +94,13 @@ class TransformerConfig:
         self.layer_norm_eps = layer_norm_eps
         self.use_peer = use_peer
         self.peer_config = peer_config or {}
-        self.use_mla = use_mla
+        # self.use_mla = use_mla # MLA is now always used
         self.mla_config = mla_config or {}
         self.vocab_size = vocab_size
 
 
 class TransformerBlock(nn.Module):
-    """Transformer block with support for MLA and PEER."""
+    """Transformer block implementing Multi-Headed Latent Attention (MLA) and PEER."""
 
     def __init__(self, config: TransformerConfig, layer_idx: int):
         super().__init__()
@@ -111,26 +111,16 @@ class TransformerBlock(nn.Module):
         self.ln_1 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.ln_2 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        # Attention layer - use MLA if configured
-        if config.use_mla:
-            # Ensure mla_config is passed correctly
-            mla_params = config.mla_config or {}
-            self.attention = MultiHeadedLatentAttention(
-                hidden_size=config.hidden_size,
-                num_heads=config.num_attention_heads,
-                dropout=config.attention_dropout,
-                # layer_idx=layer_idx, # Removed layer_idx argument
-                **mla_params,
-            )
-        else:
-            # Standard multi-head attention (Keep nn.MultiheadAttention for now, or replace with te.DotProductAttention if desired)
-            # Note: Standard MHA won't use FP8 unless replaced with TE version
-            self.attention = nn.MultiheadAttention(
-                embed_dim=config.hidden_size,
-                num_heads=config.num_attention_heads,
-                dropout=config.attention_dropout,
-                batch_first=True,
-            )
+        # Attention layer - always use MLA
+        # Ensure mla_config is passed correctly
+        mla_params = config.mla_config or {}
+        self.attention = MultiHeadedLatentAttention(
+            hidden_size=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout,
+            # layer_idx=layer_idx, # Removed layer_idx argument
+            **mla_params,
+        )
 
         # MLP/PEER layer
         if config.use_peer and layer_idx % 2 == 1:  # Apply PEER to alternate layers
@@ -170,11 +160,10 @@ class TransformerBlock(nn.Module):
         # TE LayerNorm handles precision internally when used with fp8_autocast
         hidden_states_ln = self.ln_1(hidden_states)
 
-        if self.config.use_mla:
-            # MLA path expects hidden_states, cos, sin, attention_mask, position_ids, past_key_value
-            attn_output, attn_weights, present_key_value = self.attention(
-                hidden_states=hidden_states_ln,
-                cos=cos,
+        # MLA path expects hidden_states, cos, sin, attention_mask, position_ids, past_key_value
+        attn_output, attn_weights, present_key_value = self.attention(
+            hidden_states=hidden_states_ln,
+            cos=cos,
                 sin=sin,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -182,26 +171,7 @@ class TransformerBlock(nn.Module):
                 output_attentions=output_attentions,
                 use_cache=use_cache,
             )
-            # Note: present_key_value from MLA FlashAttention impl is currently None
-        else:
-            # Standard multi-head attention path
-            # nn.MultiheadAttention expects query, key, value
-            # It doesn't directly use cos, sin, position_ids in its signature
-            # RoPE would need to be applied *before* passing to standard MHA if needed
-            # Also, standard MHA doesn't return past_key_value tuple directly
-            attn_output, attn_weights = self.attention(
-                hidden_states_ln,  # query
-                hidden_states_ln,  # key
-                hidden_states_ln,  # value
-                key_padding_mask=attention_mask[:, 0, 0, :]
-                if attention_mask is not None and attention_mask.dim() == 4
-                else None,  # Adjust mask format if needed
-                attn_mask=attention_mask,  # Pass the 4D mask if appropriate for MHA variant
-                need_weights=output_attentions,
-                # Cache handling needs external management for standard nn.MultiheadAttention
-            )
-            # Standard MHA doesn't return cache, set present_key_value to None
-            present_key_value = None  # Standard MHA doesn't return cache in this format
+        # Note: present_key_value from MLA FlashAttention impl is currently None
 
         # Residual connection
         # Note: TE Linear layers often don't need explicit dropout after them if using TE's built-in dropout fusion
@@ -237,7 +207,7 @@ class TransformerBlock(nn.Module):
 
 
 class FoundationModel(nn.Module):
-    """Foundation Language Model integrating PEER and Multi-Headed Latent Attention."""
+    """Foundation Language Model implementing PEER and Multi-Headed Latent Attention."""
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
