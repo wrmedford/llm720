@@ -59,8 +59,12 @@ pip install -e .
 # For development
 pip install -e ".[dev]"
 
-# For evaluation
-pip install -e ".[evals]"
+# For evaluation (includes OpenAI evals library)
+pip install -e ".[eval]"
+
+# Note: Triton installation might require specific CUDA versions.
+# If the automatic installation fails, please refer to the official Triton documentation:
+# https://triton-lang.org/main/getting-started/installation.html
 ```
 
 ## Getting Started
@@ -87,28 +91,40 @@ python scripts/train.py --config configs/config.yaml
 
 ```
 llm/                      # Main package
-├── models/               # Model implementations
-│   ├── attention.py      # Multi-Headed Latent Attention
-│   ├── experts.py        # PEER implementation
-│   └── foundation.py     # Base model architecture
-├── training/             # Training functionality
-│   └── train.py          # Main training loop
+├── models/               # Model implementations (MLA, PEER, Foundation)
+│   ├── __init__.py
+│   ├── attention.py
+│   ├── experts.py
+│   └── foundation.py
+├── training/             # Training loop, config, ablation logic
+│   ├── __init__.py
+│   ├── ablation.py
+│   └── train.py
 ├── data/                 # Dataset handling
-│   └── datasets.py       # Dataset loading and processing
-├── config/               # Configuration management
-│   └── defaults.py       # Configuration utilities
+│   ├── __init__.py
+│   └── datasets.py
+├── config/               # Configuration loading/saving
+│   ├── __init__.py
+│   └── defaults.py
+├── ops/                  # Custom operations (e.g., Triton kernels)
+│   └── triton_peer_kernels.py
 └── utils/                # Utility functions
-    ├── eval/             # Evaluation utilities
-    │   ├── benchmark.py  # Benchmark evaluation
-    │   ├── perplexity.py # Perplexity evaluation
-    │   └── size.py       # Model size analysis
-    └── experts/          # Expert mechanism utilities
-        └── tracking.py   # Expert usage tracking
+    ├── __init__.py
+    ├── eval/             # Evaluation scripts (perplexity, benchmarks, size)
+    │   ├── __init__.py
+    │   ├── benchmark.py
+    │   ├── perplexity.py
+    │   └── size.py
+    └── experts/          # Expert utilities (tracking)
+        ├── __init__.py
+        └── tracking.py
 
-scripts/                  # Entry point scripts
-├── train.py              # Training script
-├── train.sh              # Distributed training script
-└── run_evaluation.py     # Evaluation script
+scripts/                  # Entry point scripts callable from command line
+├── analyze_model.py      # Model analysis script
+├── run_ablations.py      # Ablation study runner script
+├── run_evaluation.py     # Evaluation script (perplexity, benchmarks)
+├── train.py              # Training script entry point
+└── train.sh              # Distributed training launch script
 
 configs/                  # Configuration files
 ├── config.yaml           # Main configuration

@@ -36,9 +36,10 @@ train_config:
   learning_rate: 5e-5
   weight_decay: 0.01
   max_grad_norm: 1.0
-  num_train_epochs: 3
+  # num_train_epochs: 3 # Using max_steps is more robust for iterable datasets
+  max_steps: 100000 # Example: Train for 100k steps
   lr_scheduler_type: "cosine"
-  warmup_ratio: 0.1
+  warmup_ratio: 0.1 # Warmup over 10% of max_steps
   log_level: "info"
   logging_steps: 100
   save_steps: 1000

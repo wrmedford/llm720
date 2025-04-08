@@ -10,24 +10,37 @@ for the foundation model architecture, helping understand the efficiency gains f
 
 import argparse
 import logging
-import sys
 import os
+import sys
 
 # Add parent directory to path to ensure imports work correctly
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# This import is intentionally placed here after modifying the path
+# flake8: noqa: E402
 from llm.utils.eval.size import main as size_main
 
 
 def main():
     """Main entry point for the model analysis script."""
-    parser = argparse.ArgumentParser(description="Analyze model parameters for PEER architecture.")
-    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to configuration file")
-    parser.add_argument("--checkpoint", type=str, help="Path to model checkpoint (optional)")
-    parser.add_argument("--output", type=str, help="Path to save visualization (optional)")
+    parser = argparse.ArgumentParser(
+        description="Analyze model parameters for PEER architecture."
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/config.yaml",
+        help="Path to configuration file",
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, help="Path to model checkpoint (optional)"
+    )
+    parser.add_argument(
+        "--output", type=str, help="Path to save visualization (optional)"
+    )
     parser.add_argument("--json", type=str, help="Path to save JSON results (optional)")
     args = parser.parse_args()
-    
+
     # Call the size module's main function
     size_main(args)
 
@@ -39,7 +52,7 @@ if __name__ == "__main__":
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    
+
     # Handle errors gracefully
     try:
         main()
@@ -48,5 +61,6 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Error during analysis: {e}")
         import traceback
+
         traceback.print_exc()
         raise
