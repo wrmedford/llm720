@@ -52,29 +52,115 @@ The goal is to build powerful LLMs that are efficient to train and run, leveragi
 
 ## Installation
 
-```bash
-# Install the package and dependencies
-pip install -e .
+We recommend using `uv` for faster environment management.
 
-# For development
-pip install -e ".[dev]"
+1.  **Install `uv` (if you haven't already):**
+    ```bash
+    # Follow instructions at https://github.com/astral-sh/uv
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+2.  **Create and activate a virtual environment:**
+    ```bash
+    uv venv
+    source .venv/bin/activate
+    # Or `source .venv/bin/activate.fish` for fish shell, etc.
+    ```
+3.  **Install PyTorch:** Packages like `flash-attn` and `triton` require PyTorch to be installed *before* they are built. Install PyTorch first, matching your CUDA version (see [https://pytorch.org/](https://pytorch.org/)).
+    ```bash
+    # Example for CUDA 12.1 on x86_64 - Adjust if necessary!
+    # uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# For evaluation (includes OpenAI evals library)
-pip install -e ".[eval]"
+    # Example for CUDA 12.1 on ARM (e.g., GH200) - Adjust if necessary!
+    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    ```
+    *Verify the correct CUDA version for your system and drivers.* Find available wheels at [https://pytorch.org/](https://pytorch.org/).
 
-# Note: Triton installation might require specific CUDA versions.
-# If the automatic installation fails, please refer to the official Triton documentation:
-# https://triton-lang.org/main/getting-started/installation.html
-```
+4.  **Install the package and remaining dependencies:** Use `--no-build-isolation` to ensure packages like `flash-attn`, `triton`, and `transformer-engine` can find the already installed PyTorch during their build process.
+    ```bash
+    # For running ablation studies (requires dev and eval dependencies)
+    # This includes flash-attn, triton, transformer-engine, pytest, evals, etc.
+    uv pip install --no-build-isolation -e ".[dev,evals]"
+
+    # --- OR --- Install only what you need:
+
+    # Base installation (training/inference - includes flash-attn, triton, transformer-engine)
+    # uv pip install --no-build-isolation -e .
+
+    # For development (linters, formatters, testing tools)
+    # uv pip install --no-build-isolation -e ".[dev]"
+
+    # For running evaluations (OpenAI evals library)
+    # uv pip install --no-build-isolation -e ".[eval]"
+    ```
+
+    **ARM/GH200 Installation Notes:**
+    - **`flash-attn` and `triton`:** Installation on ARM architectures might fail as pre-built wheels are often unavailable. You may need to:
+        - **Build from source:** Follow the official instructions for `flash-attn` and `triton`, which may require specific compilers (like `gcc`, `g++`) and the CUDA toolkit installed on your system.
+        - **Comment out:** If you don't strictly need the Triton kernels for PEER or FlashAttention for MLA initially, you can temporarily comment out `flash-attn` and `triton` in `setup.py` and reinstall using the command above. The code includes PyTorch fallbacks.
+    - **`transformer-engine`:** Should generally install correctly on ARM/Hopper via pip if compatible wheels exist.
+
+    If installation fails, check the specific error messages and consult the documentation for `flash-attn`, `triton`, and `transformer-engine`.
+
+## Building Dependencies from Source (Advanced)
+
+In some cases, especially on specific architectures like ARM (e.g., GH200) or when using non-standard CUDA versions (like 12.8), pre-built wheels for dependencies like PyTorch, Triton, FlashAttention, and Transformer Engine might not be available or compatible.
+
+This project includes a script to build these core dependencies from source tailored to your environment.
+
+**Prerequisites:**
+
+*   A C++ compiler (like `g++`) and build tools (`build-essential` on Debian/Ubuntu).
+*   CMake (`>=3.18`).
+*   Ninja (`ninja-build` on Debian/Ubuntu).
+*   The CUDA Toolkit matching the version you want to build against (e.g., 12.8) installed, with `nvcc` in your `PATH`.
+*   CUDA development libraries (`cuda-cupti-dev`, `cuda-nvml-dev`, `libnccl-dev` on Debian/Ubuntu, matching your CUDA version).
+*   `uv` (install via `curl -LsSf https://astral.sh/uv/install.sh | sh`).
+*   For ARM builds: `scons` and `patchelf` (for building ARM Compute Library).
+
+**Usage:**
+
+1.  **Customize Build (Optional):** You can control the build process using environment variables before running the script:
+    *   `PYTHON_VERSION`: Target Python version (default: 3.12).
+    *   `CUDA_VERSION`: Target CUDA version (default: 12.8.90).
+    *   `TORCH_CUDA_ARCH_LIST`: Target GPU architectures (default: 9.0a for Hopper).
+    *   `SKIP_TORCH=1`, `SKIP_TRITON=1`, `SKIP_FLASH_ATTN=1`, `SKIP_TE=1`: Skip building specific components if they are already installed or not needed.
+    *   `TORCH_REF`, `TRITON_REF`, `FLASH_ATTN_REF`, `TE_REF`: Specify git tags/branches for dependencies.
+
+2.  **Run the Build Script:**
+    ```bash
+    bash scripts/build_from_source.sh
+    ```
+    This script will:
+    *   Set up a virtual environment (`.venv`).
+    *   Clone the source code for PyTorch, Triton, FlashAttention, and Transformer Engine into the `src/` directory.
+    *   Build each dependency using the specified CUDA version and architecture flags.
+    *   (On ARM) Build the ARM Compute Library.
+    *   Place the compiled wheels into the `wheels/` directory.
+    *   Install the built wheels using `uv`.
+    *   Install the `llm` project itself in editable mode.
+
+3.  **Activate Environment:**
+    ```bash
+    source .venv/bin/activate
+    ```
+
+After the script completes successfully, your environment will have the core dependencies built specifically for your system, and the `llm` project installed using them.
 
 ## Getting Started
 
-1. Install the required dependencies:
-```bash
-pip install -e .
-```
+1.  Install the required dependencies. Choose **one** of the following methods:
+    *   **Standard Installation (Recommended):** Follow the steps in the [Installation](#installation) section using `uv pip install`. This uses pre-built wheels if available.
+    *   **Build from Source (Advanced):** If standard installation fails or you need specific versions/CUDA support, follow the steps in the [Building Dependencies from Source](#building-dependencies-from-source-advanced) section.
 
-2. Prepare your configuration file:
+    Example for basic training after standard install (ARM/GH200, CUDA 12.1):
+    ```bash
+    # Activate environment: source .venv/bin/activate
+    # Install PyTorch (example for CUDA 12.1):
+    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    # Install base package (handle flash-attn/triton build errors if they occur):
+    uv pip install --no-build-isolation -e .
+    ```
+2.  Prepare your configuration file:
 - See `configs/config.yaml` for an example configuration
 
 3. Start training:

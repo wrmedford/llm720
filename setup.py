@@ -26,8 +26,9 @@ setup(
         "tabulate>=0.8.0",
         "flash-attn>=2.0.0; platform_system=='Linux'", # flash-attn is often Linux-only
         "transformer-engine>=1.0",  # Add Transformer Engine dependency
-        # Add Triton dependency - conditional on platform and Python version
-        "triton>=2.1.0; platform_system=='Linux' and python_version>='3.8' and python_version<'3.12'",
+        # Add Triton dependency - conditional on platform.
+        # NOTE: ARM support might require building from source. Python version constraint removed.
+        "triton>=2.1.0; platform_system=='Linux'",
     ],
     extras_require={
         "dev": [
