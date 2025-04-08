@@ -306,13 +306,13 @@ class MultiHeadedLatentAttention(nn.Module):
                 - present_key_value (`Optional[Tuple[torch.Tensor, torch.Tensor]]`):
                     Updated cache `(kv_c_cache, k_pe_cache)`.
         """
+        # Get logger instance - assumes logger is configured elsewhere
+        import logging
+        logger = logging.getLogger(__name__)
+
         if output_attentions:
-            # logger.warning(
-            #    "FlashAttention does not support outputting attention weights." # noqa E501
-            # )
-            print(
-                "Warning: FlashAttention does not support outputting "  # noqa E501
-                "attention weights."
+            logger.warning(
+               "FlashAttention does not support outputting attention weights."
             )
 
         bsz, q_len, _ = hidden_states.shape
@@ -504,7 +504,8 @@ class MultiHeadedLatentAttention(nn.Module):
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_k,
                     dropout_p=0.0,  # No dropout during inference
-                    softmax_scale=self.softmax_scale,  # Use precomputed scale # TODO: Verify if scale needs adjustment for MQA head dim
+                    # Scale should be based on the MQA query dimension used in dot product
+                    softmax_scale=(self.kv_lora_rank + self.qk_rope_head_dim)**-0.5,
                     causal=True,  # Causal mask needed
                 )
                 # attn_output_mqa shape:

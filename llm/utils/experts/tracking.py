@@ -338,51 +338,42 @@ def hook_expert_tracking(module, tracker):
         tracker: ExpertUsageTracker instance
     """
 
-    def _expert_forward_hook(layer_idx, mod, input, output):
-        """Hook function to record expert usage."""
-        # Check if expert indices are available (saved during forward pass)
-        if hasattr(mod, "_last_expert_indices"):
-            batch_size, seq_len = input[0].shape[:2]
+    # Hook function to be registered on PEER layer's forward pass
+    def _peer_forward_hook(layer_idx, tracker, module, args, output):
+        """Records expert usage after PEER forward pass."""
+        # The PEER forward method saves indices in `_last_expert_indices`
+        if hasattr(module, "_last_expert_indices") and module._last_expert_indices is not None:
+            # Input to PEER is hidden_states
+            hidden_states = args[0]
+            batch_size, seq_len = hidden_states.shape[:2]
             tracker.record_usage(
                 layer_idx=layer_idx,
-                expert_indices=mod._last_expert_indices,
+                expert_indices=module._last_expert_indices,
                 batch_size=batch_size,
                 seq_len=seq_len,
             )
+        else:
+            # Log a warning if indices weren't found (might indicate an issue)
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Could not find '_last_expert_indices' on PEER layer {layer_idx} after forward pass.")
 
-    def _find_and_hook_peer_layers(module, current_layer_idx=0, prefix=""):
-        """
-        Recursively find and hook PEER layers, correctly tracking layer index.
-        Returns the next available layer index.
-        """
-        layer_idx = current_layer_idx
-        for name, child in module.named_children():
-            if "PEER" in child.__class__.__name__:
-                # Use the current layer_idx for this PEER layer
-                hook_layer_idx = layer_idx
-                # Store the indices during get_indices function
-                original_get_indices = child.get_indices
 
-                def _modified_get_indices(self, original_fn, queries, top_k):
-                    indices, scores = original_fn(self, queries, top_k)
-                    # Save the indices for the forward hook to access
-                    self._last_expert_indices = indices
-                    return indices, scores
-
-                # Apply monkey patches
-                child.get_indices = partial(
-                    _modified_get_indices, child, original_get_indices
+    # Find PEER layers within TransformerBlocks and register hooks
+    peer_layer_count = 0
+    # Assuming the model has a 'blocks' attribute which is a ModuleList of TransformerBlocks
+    if hasattr(module, 'blocks') and isinstance(module.blocks, torch.nn.ModuleList):
+        for block_idx, block in enumerate(module.blocks):
+            # Assuming the PEER layer is stored in 'feed_forward' attribute of the block
+            if hasattr(block, 'feed_forward') and "PEER" in block.feed_forward.__class__.__name__:
+                # The layer index for tracking corresponds to the PEER layer's sequence
+                hook_layer_idx = peer_layer_count
+                # Register the forward hook, passing the correct layer index and tracker
+                block.feed_forward.register_forward_hook(
+                    partial(_peer_forward_hook, hook_layer_idx, tracker)
                 )
-
-                # Register forward hook for this layer using the captured index
-                child.register_forward_hook(partial(_expert_forward_hook, hook_layer_idx))
-                layer_idx += 1 # Increment the index for the *next* PEER layer
-
-            # Recursively process child modules, passing the updated layer_idx
-            elif len(list(child.children())) > 0:
-                layer_idx = _find_and_hook_peer_layers(child, current_layer_idx=layer_idx, prefix=f"{prefix}.{name}")
-
-        return layer_idx # Return the index for the next layer after processing this module
-
-    # Find and hook all PEER layers
-    _find_and_hook_peer_layers(module)
+                peer_layer_count += 1
+    else:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning("Could not find 'blocks' attribute or it's not a ModuleList. Expert tracking hooks not applied.")

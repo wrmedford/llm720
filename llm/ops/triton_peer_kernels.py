@@ -253,10 +253,25 @@ if HAS_TRITON:
             combined_indices_flat = tl.reshape(
                 combined_indices, (BLOCK_SIZE_T * combined_indices.shape[1],)
             )
-            # Gather the top k indices
-            top_k_indices = tl.load(
-                combined_indices_flat + gather_indices
-            )  # Shape [BLOCK_SIZE_T, top_k]
+            # Gather the top k indices using the relative indices
+            # Note: tl.gather requires the source pointer and the indices pointer.
+            # combined_indices_flat is the source data.
+            # gather_indices contains the indices *into* combined_indices_flat.
+            # We need to ensure gather_indices is correctly shaped and used.
+            # Let's directly use the relative indices to gather from combined_indices along axis=1.
+            # This requires careful indexing or reshaping. A simpler way might be:
+            top_k_indices = tl.zeros((BLOCK_SIZE_T, top_k), dtype=tl.int32)
+            for k in range(top_k):
+                # Get the relative index for the k-th top score for each token
+                relative_idx_k = top_k_relative_indices[:, k] # Shape [BLOCK_SIZE_T]
+                # Gather the corresponding expert index from combined_indices
+                # combined_indices shape: [BLOCK_SIZE_T, top_k + BLOCK_SIZE_E]
+                # Need to access combined_indices[token_idx, relative_idx_k[token_idx]]
+                # Use tl.load with offsets
+                indices_ptr = combined_indices + tl.arange(0, BLOCK_SIZE_T)[:, None] * combined_indices.shape[1] + relative_idx_k[:, None]
+                kth_indices = tl.load(indices_ptr) # Load the indices corresponding to the k-th highest scores
+                top_k_indices = tl.where(k == tl.arange(0, top_k), kth_indices, top_k_indices)
+
 
         # --- Store final top-k results ---
         oi_ptrs = (

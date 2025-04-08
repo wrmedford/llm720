@@ -3,7 +3,7 @@ import torch
 
 # Adjust imports based on your project structure
 from llm.models.experts import PEER
-from llm.ops.triton_peer_kernels import HAS_TRITON
+from llm.ops.triton_peer_kernels import HAS_TRITON, peer_selection_triton
 
 # Mark all tests in this file to be skipped if CUDA is not available
 pytestmark = pytest.mark.skipif(
@@ -101,55 +101,6 @@ test_configs = [
         id="3d_fp32",
     ),
 ]
-
-
-# --- Helper Function ---
-def force_peer_implementation(module: PEER, use_triton: bool):
-    """Monkey-patches the PEER forward method to force Triton or PyTorch."""
-    original_forward = module.forward
-
-    def patched_forward(hidden_states):
-        # Temporarily override HAS_TRITON for this call
-
-        # Need to modify the check within the forward function or the function it calls
-        # Option 1: Modify the check directly (if simple)
-        # Option 2: Patch the called function (peer_selection_triton or _get_expert_indices_pytorch) - complex
-        # Option 3: Modify the module's state temporarily (cleanest if possible)
-
-        # Let's assume the check inside forward uses HAS_TRITON from llm.ops.triton_peer_kernels
-        # We need to patch *that* specific import within the scope of the forward call.
-        # This is tricky. A simpler approach for testing is to modify the PEER class
-        # to allow selecting the implementation via a flag.
-
-        # --- Alternative: Modify PEER class for testing ---
-        # Add a `_force_implementation` attribute to PEER:
-        # if hasattr(self, '_force_implementation'):
-        #     if self._force_implementation == 'triton': use_triton_path = True
-        #     elif self._force_implementation == 'pytorch': use_triton_path = False
-        # else:
-        #     use_triton_path = HAS_TRITON and peer_selection_triton is not None
-        # For now, we assume the test modifies the global HAS_TRITON, which is NOT ideal but simpler for this example.
-        # A better solution involves refactoring PEER or using mock.patch.
-
-        import llm.ops.triton_peer_kernels as triton_kernels_module
-
-        original_has_triton_in_module = triton_kernels_module.HAS_TRITON
-        triton_kernels_module.HAS_TRITON = use_triton
-        try:
-            output = original_forward(hidden_states)
-        finally:
-            # Restore original state
-            triton_kernels_module.HAS_TRITON = original_has_triton_in_module
-        return output
-
-    # For this example, we'll just rely on the global HAS_TRITON check within PEER's forward
-    # and assume the test runner can influence it (e.g., by setting env var before test run)
-    # or we accept this test compares Triton vs. the *actual* fallback path.
-    # A truly robust test would use mocking or class modification.
-    print(
-        "Note: Test assumes PEER checks HAS_TRITON dynamically or relies on global state."
-    )
-    pass  # No actual patching applied here, relies on PEER's internal check
 
 
 # --- Test Fixtures ---

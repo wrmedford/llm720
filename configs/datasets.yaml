@@ -10,21 +10,20 @@ data_mixes:
     datasets:
       # Replace these with your actual high-quality datasets
       - name: "custom_dataset_1"
-        path: "/path/to/your/dataset_1"  # Can be local path or HF dataset name
+        path: "/local/path/to/dataset_1.jsonl"  # Example local path (use .jsonl, .csv, etc.) or HF dataset name
+        format: "json" # Specify format if local (e.g., json, csv, text)
         split: "train"
         streaming: true
         weight: 0.4
         text_field: "text"
-      
       - name: "custom_dataset_2"
-        path: "/path/to/your/dataset_2"
+        path: "huggingface_user/custom_dataset_2" # Example HF dataset name
         split: "train"
         streaming: true
         weight: 0.3
         text_field: "text"
-      
       - name: "custom_dataset_3"
-        path: "/path/to/your/dataset_3"
+        path: "/another/local/path/dataset_3" # Example local path (directory assumed)
         split: "train"
         streaming: true
         weight: 0.2
@@ -43,7 +42,7 @@ data_mixes:
     name: "science_mix"
     datasets:
       - name: "custom_science_dataset"
-        path: "/path/to/science_dataset"
+        path: "/local/path/to/science_data" # Example local path
         split: "train"
         streaming: true
         weight: 0.4
@@ -62,9 +61,8 @@ data_mixes:
         streaming: true
         weight: 0.2
         text_field: "text"
-      
       - name: "general_knowledge"
-        path: "/path/to/general_knowledge_dataset"
+        path: "huggingface_user/general_knowledge" # Example HF dataset name
         split: "train"
         streaming: true
         weight: 0.1
@@ -75,7 +73,8 @@ data_mixes:
     name: "code_expert_mix"
     datasets:
       - name: "custom_code_dataset"
-        path: "/path/to/code_dataset"
+        path: "/local/path/to/code_data.jsonl" # Example local path
+        format: "json"
         split: "train"
         streaming: true
         weight: 0.5
@@ -94,9 +93,8 @@ data_mixes:
         streaming: true
         weight: 0.2
         text_field: "instruction"
-      
       - name: "custom_base_dataset"
-        path: "/path/to/base_dataset"
+        path: "huggingface_user/base_data" # Example HF dataset name
         split: "train"
         streaming: true
         weight: 0.1
