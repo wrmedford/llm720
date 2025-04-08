@@ -4,7 +4,12 @@ This repository contains an implementation for training language models with Par
 
 ## About This Project
 
-This is a hobby project implementing recent research from DeepSeek and DeepMind. It builds upon the foundation established by projects like LLM360, focusing on parameter-efficient models that can be trained with reasonable compute resources.
+This project provides a framework for training large language models (LLMs) with a focus on parameter efficiency and cost-effective training, drawing inspiration from recent research by DeepSeek (e.g., DeepSeek-V2/V3, Mixture-of-A-Million-Experts). It implements two core architectural innovations:
+
+1.  **Parameter Efficient Expert Retrieval (PEER):** An advanced Mixture-of-Experts (MoE) layer designed to scale to millions of tiny experts (often single neurons). Instead of traditional routing, PEER uses efficient "product key" retrieval to select a small subset of these experts for each token. This allows for a massive total parameter count while keeping the activated parameters per token low, aiming for high performance with reduced computational cost.
+2.  **Multi-Headed Latent Attention (MLA):** An efficient attention mechanism based on the DeepSeek V3 architecture. It employs techniques like low-rank projections and RoPE/NoPE decomposition to optimize attention computation, particularly for inference, and integrates with optimized kernels like FlashMLA.
+
+The goal is to build powerful LLMs that are efficient to train and run, leveraging sparse activation of a vast number of parameters. The framework provides the necessary components for training, dataset management, evaluation, and analysis of models using these architectures. It differs from standard Transformer or MoE implementations by incorporating the specific PEER expert mechanism and the DeepSeek-style MLA.
 
 ## Features
 
@@ -17,6 +22,7 @@ This is a hobby project implementing recent research from DeepSeek and DeepMind.
   - Separate projections for query, key, and value
   - Query and key decomposed into rope and nope parts
   - Support for different head dimensions
+  - Optimized implementation using FlashMLA (from DeepSeek)
 
 - **Dataset Management**
   - Streaming HuggingFace datasets

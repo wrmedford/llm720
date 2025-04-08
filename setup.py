@@ -24,7 +24,8 @@ setup(
         "seaborn>=0.12.0",
         "pandas>=1.3.0",
         "tabulate>=0.8.0",
-        "flash_mla",  # Add FlashMLA dependency
+        "flash-attn>=2.0.0", # Add flash-attn dependency
+        "transformer-engine>=1.0", # Add Transformer Engine dependency
     ],
     extras_require={
         "dev": [

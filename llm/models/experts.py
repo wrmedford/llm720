@@ -16,6 +16,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformer_engine.pytorch as te # Import Transformer Engine
+
+from llm.ops.triton_peer_kernels import HAS_TRITON, peer_selection_triton
 
 
 class PEER(nn.Module):
@@ -64,13 +67,15 @@ class PEER(nn.Module):
             f"Product of dimensions {product_key_dim} = {product_size} must equal "
             f"the number of experts {num_experts}"
         )
-        
-        # Create the query network
-        self.query_proj = nn.Linear(input_dim, num_heads * query_dim)
-        
+
+        # Create the query network (replace with TE Linear)
+        self.query_proj = te.Linear(input_dim, num_heads * query_dim)
+
         if batch_norm_query:
+            # Keep standard BatchNorm for now, TE doesn't have a direct replacement
+            # Ensure it runs in FP32 (handled below in forward)
             self.query_batch_norm = nn.BatchNorm1d(query_dim)
-        
+
         # Create sub-key embeddings for each dimension
         self.sub_keys = nn.ParameterList()
         for i, dim_size in enumerate(product_key_dim):
@@ -108,103 +113,67 @@ class PEER(nn.Module):
             chunks.append(queries[..., start_idx:end_idx])
         
         return chunks
-    
-    def get_indices(self, queries, top_k):
+
+    def _get_expert_indices_pytorch(self, queries, top_k):
         """
-        Retrieve the top-k experts using product keys.
-        
-        Args:
-            queries: Tensor of shape [batch_size, seq_len, num_heads, query_dim]
-            top_k: Number of experts to retrieve per head
-            
-        Returns:
-            indices: Tensor of shape [batch_size, seq_len, num_heads, top_k] containing expert indices
-            scores: Tensor of shape [batch_size, seq_len, num_heads, top_k] containing expert scores
+        PyTorch implementation for retrieving top-k experts using product keys.
+        Used as a fallback if Triton is not available or for comparison.
         """
         batch_size, seq_len, num_heads, _ = queries.shape
         device = queries.device
-        
-        # Split queries along the feature dimension for each product key dimension
-        query_chunks = self.split_queries(queries)
-        
-        # Compute scores for each dimension with its corresponding sub-keys
-        dim_scores = []
-        dim_indices = []
-        
+        num_dims = len(self.product_key_dim)
+
+        # Split queries along the feature dimension
+        query_chunks = self.split_queries(queries) # List of [B, S, H, sub_query_dim]
+
+        # Compute scores for each dimension
+        all_dim_scores = []
         for i, (q_chunk, sub_keys) in enumerate(zip(query_chunks, self.sub_keys)):
-            # q_chunk: [batch_size, seq_len, num_heads, sub_query_dim]
-            # sub_keys: [dim_size, sub_query_dim]
-            
             # Normalize if requested
             if self.norm_keys:
                 sub_keys = F.normalize(sub_keys, dim=-1)
             if self.norm_query:
                 q_chunk = F.normalize(q_chunk, dim=-1)
-            
-            # Compute scores for this dimension
-            # [batch_size, seq_len, num_heads, dim_size]
-            scores = torch.matmul(q_chunk, sub_keys.t())
-            
-            # Get top-k for this dimension
-            dim_top_k = min(self.product_key_dim[i], int(np.ceil(top_k ** (1 / len(self.product_key_dim)))))
-            dim_top_scores, dim_top_indices = torch.topk(scores, k=dim_top_k, dim=-1)
-            
-            dim_scores.append(dim_top_scores)
-            dim_indices.append(dim_top_indices)
-        
-        # Build the Cartesian product of top indices from each dimension
-        # This gives us candidate experts to consider
-        all_indices = []
-        all_scores = []
-        
-        # Convert flattened indices to n-dimensional indices
-        indices_ranges = [range(dim_size) for dim_size in self.product_key_dim]
-        
-        # For each item in the batch and each head
-        for b in range(batch_size):
-            for s in range(seq_len):
-                for h in range(num_heads):
-                    # Get the top indices for each dimension for this batch item and head
-                    selected_indices = [indices[b, s, h].tolist() for indices in dim_indices]
-                    
-                    # Build Cartesian product of selected indices across dimensions
-                    candidate_tuples = []
-                    for idx_tuple in itertools.product(*selected_indices):
-                        # Convert the n-dimensional index tuple to a flat index
-                        flat_idx = 0
-                        multiplier = 1
-                        for i, idx in enumerate(reversed(idx_tuple)):
-                            flat_idx += idx * multiplier
-                            if i < len(self.product_key_dim) - 1:
-                                multiplier *= self.product_key_dim[-(i+1)]
-                        
-                        # Compute the total score for this expert as the sum of individual dimension scores
-                        total_score = sum(dim_scores[d][b, s, h, selected_indices[d].index(idx_tuple[d])]
-                                        for d in range(len(self.product_key_dim)))
-                        
-                        candidate_tuples.append((flat_idx, total_score.item()))
-                    
-                    # Sort by total score and get the top_k
-                    candidate_tuples.sort(key=lambda x: x[1], reverse=True)
-                    top_experts = candidate_tuples[:top_k]
-                    
-                    # Extract indices and scores
-                    expert_indices = [t[0] for t in top_experts]
-                    expert_scores = [t[1] for t in top_experts]
-                    
-                    # Pad if necessary
-                    if len(expert_indices) < top_k:
-                        expert_indices.extend([0] * (top_k - len(expert_indices)))
-                        expert_scores.extend([-float('inf')] * (top_k - len(expert_scores)))
-                    
-                    all_indices.append(expert_indices)
-                    all_scores.append(expert_scores)
-        
-        # Reshape to [batch_size, seq_len, num_heads, top_k]
-        indices = torch.tensor(all_indices, device=device).view(batch_size, seq_len, num_heads, top_k)
-        scores = torch.tensor(all_scores, device=device).view(batch_size, seq_len, num_heads, top_k)
-        
-        return indices, scores
+
+            # Compute scores: [B, S, H, dim_size_i]
+            dim_scores = torch.matmul(q_chunk, sub_keys.t())
+            all_dim_scores.append(dim_scores)
+
+        # Combine scores using broadcasting and summation
+        # Create meshgrid of indices for each dimension
+        dim_indices = [torch.arange(d, device=device) for d in self.product_key_dim]
+        mesh_indices = torch.stack(torch.meshgrid(*dim_indices, indexing='ij'), dim=-1) # Shape [d1, d2, ..., dn, n_dims]
+
+        # Flatten meshgrid indices to [num_experts, n_dims]
+        flat_mesh_indices = mesh_indices.view(-1, num_dims) # Shape [num_experts, n_dims]
+
+        # Gather scores corresponding to each expert index tuple
+        # Expand all_dim_scores for gathering: List of [B, S, H, 1, dim_size_i]
+        expanded_scores = [ds.unsqueeze(-2) for ds in all_dim_scores]
+
+        # Gather scores for each dimension based on the flat_mesh_indices
+        # flat_mesh_indices[:, i] gives the index for the i-th dimension for all experts
+        gathered_scores = []
+        for dim_idx in range(num_dims):
+            # Indices for this dimension: [num_experts]
+            indices_for_dim = flat_mesh_indices[:, dim_idx].unsqueeze(0).unsqueeze(0).unsqueeze(0) # Shape [1, 1, 1, num_experts]
+            indices_for_dim = indices_for_dim.expand(batch_size, seq_len, num_heads, -1) # Shape [B, S, H, num_experts]
+
+            # Scores for this dimension: [B, S, H, dim_size_i]
+            scores_for_dim = all_dim_scores[dim_idx]
+
+            # Gather: [B, S, H, num_experts]
+            gathered = torch.gather(scores_for_dim, dim=-1, index=indices_for_dim)
+            gathered_scores.append(gathered)
+
+        # Sum scores across dimensions: [B, S, H, num_experts]
+        total_scores = torch.stack(gathered_scores, dim=0).sum(dim=0)
+
+        # Get top-k experts based on total scores
+        top_scores, top_indices = torch.topk(total_scores, k=top_k, dim=-1)
+
+    # Removed _get_expert_indices_triton and _get_expert_indices_pytorch
+    # as their logic is now intended to be handled by PEERSelectionFunction
 
     def forward(self, hidden_states):
         """
@@ -223,20 +192,47 @@ class PEER(nn.Module):
         queries = self.query_proj(hidden_states)
         queries = queries.view(batch_size, seq_len, self.num_heads, self.query_dim)
         
-        # Apply batch norm to queries if enabled
+        # Apply batch norm to queries if enabled (ensure FP32 execution)
         if self.batch_norm_query:
             # Reshape for batch norm
             orig_shape = queries.shape
-            queries = queries.view(-1, self.query_dim)
-            queries = self.query_batch_norm(queries)
-            queries = queries.view(*orig_shape)
-        
-        # Get expert indices and scores
-        indices, scores = self.get_indices(queries, self.num_experts_per_tok)
-        
+            input_dtype = queries.dtype
+            queries_flat = queries.view(-1, self.query_dim)
+            # Cast input to BatchNorm1d to FP32
+            queries_fp32 = queries_flat.to(torch.float32)
+            queries_normed_fp32 = self.query_batch_norm(queries_fp32)
+            # Cast output back to original dtype
+            queries = queries_normed_fp32.to(input_dtype).view(*orig_shape)
+
+        # Get expert indices and scores using the appropriate method
+        if HAS_TRITON and peer_selection_triton is not None:
+            try:
+                # Use the fused Triton kernel via the autograd function
+                indices, scores = peer_selection_triton(
+                    queries,
+                    self.sub_keys, # Pass the list of Parameter tensors
+                    self.product_key_dim,
+                    self.num_experts_per_tok,
+                    self.norm_query,
+                    self.norm_keys
+                )
+                # print("Using Triton PEER selection kernel.") # Debug print
+            except Exception as e:
+                print(f"Triton PEER selection failed: {e}. Falling back to PyTorch.")
+                # Fallback to PyTorch implementation if Triton fails
+                indices, scores = self._get_expert_indices_pytorch(queries, self.num_experts_per_tok)
+        else:
+            # Use PyTorch implementation if Triton is not available or kernel is None
+            indices, scores = self._get_expert_indices_pytorch(queries, self.num_experts_per_tok)
+            # print("Using PyTorch PEER selection.") # Debug print
+
+
+        # Store indices for tracking hook if needed
+        self._last_expert_indices = indices
+
         # Normalize scores with softmax
-        scores = F.softmax(scores, dim=-1)
-        
+        scores = F.softmax(scores, dim=-1) # scores shape: [B, S, H, top_k]
+
         # Apply expert networks
         # Get expert weights from embeddings
         down_weights = self.expert_down(indices)  # [batch, seq, heads, top_k, input_dim * expert_hidden]

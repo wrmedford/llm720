@@ -33,6 +33,9 @@ from transformers import (
     get_scheduler,
     DataCollatorForLanguageModeling,
 )
+import transformer_engine.pytorch as te # Import Transformer Engine
+from transformer_engine.common.recipe import Format, DelayedScaling # Import FP8 recipe components
+
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from accelerate.logging import get_logger
@@ -224,10 +227,19 @@ def load_checkpoint(model, optimizer, scheduler, filepath):
     if os.path.exists(model_path):
         state_dict = load_file(model_path)
         
-        if isinstance(model, DDP):
-            model.module.load_state_dict(state_dict)
-        else:
-            model.load_state_dict(state_dict)
+        # Determine the base model (handle DDP)
+        base_model = model.module if isinstance(model, DDP) else model
+        
+        # Load the state dict
+        base_model.load_state_dict(state_dict)
+        
+        # After loading weights, call post_weight_load for MLA layers
+        if hasattr(base_model, 'blocks'):
+            for block in base_model.blocks:
+                if hasattr(block, 'attention') and hasattr(block.attention, 'post_weight_load'):
+                    logger.info(f"Calling post_weight_load for layer {block.layer_idx} attention.")
+                    block.attention.post_weight_load()
+                    
     else:
         raise FileNotFoundError(f"Model weights not found at {model_path}")
     
@@ -537,22 +549,33 @@ def run_training(config: TrainerConfig):
             # Prepare inputs
             batch = prepare_model_inputs(batch, accelerator.device)
 
-            # Forward pass
-            with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-                
-                # Backward pass
-                accelerator.backward(loss)
-                
-                # Clip gradients
+            # Forward pass within fp8_autocast context
+            # Define FP8 recipe (adjust parameters as needed)
+            fp8_format = Format.HYBRID # E4M3 for forward, E5M2 for backward
+            fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max")
+
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                with accelerator.accumulate(model):
+                    outputs = model(**batch)
+                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+            # Note: Backward pass MUST be outside the fp8_autocast context
+            # Accelerator handles gradient accumulation context correctly with backward outside
+            if accelerator.is_main_process: # Only log loss once per accumulation cycle
+                 accelerator.log({"train/loss_unscaled": loss.item()}, step=global_step)
+
+            # Backward pass (outside fp8_autocast)
+            accelerator.backward(loss)
+
+            # Clip gradients (outside fp8_autocast, after backward)
+            if accelerator.sync_gradients: # Only clip when gradients are synchronized
                 if config.train_config["max_grad_norm"] > 0:
                     accelerator.clip_grad_norm_(model.parameters(), config.train_config["max_grad_norm"])
-                
-                # Optimizer step
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+
+            # Optimizer step (outside fp8_autocast, after backward and clipping)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
             
             # Update progress
             progress_bar.update(1)

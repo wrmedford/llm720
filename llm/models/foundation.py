@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple, Optional, Union, Any, Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformer_engine.pytorch as te # Import Transformer Engine
 
 from llm.models.attention import MultiHeadedLatentAttention
 from llm.models.experts import PEER
@@ -108,21 +109,24 @@ class TransformerBlock(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         
-        # Layer norms
-        self.ln_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.ln_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # Layer norms (replace with TE LayerNorm)
+        self.ln_1 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.ln_2 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         
         # Attention layer - use MLA if configured
         if config.use_mla:
+            # Ensure mla_config is passed correctly
+            mla_params = config.mla_config or {}
             self.attention = MultiHeadedLatentAttention(
                 hidden_size=config.hidden_size,
                 num_heads=config.num_attention_heads,
                 dropout=config.attention_dropout,
-                layer_idx=layer_idx, # Pass layer_idx
-                **config.mla_config,
+                # layer_idx=layer_idx, # Removed layer_idx argument
+                **mla_params,
             )
         else:
-            # Standard multi-head attention
+            # Standard multi-head attention (Keep nn.MultiheadAttention for now, or replace with te.DotProductAttention if desired)
+            # Note: Standard MHA won't use FP8 unless replaced with TE version
             self.attention = nn.MultiheadAttention(
                 embed_dim=config.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -138,154 +142,92 @@ class TransformerBlock(nn.Module):
                 **config.peer_config
             )
         else:
-            # Standard MLP
-            self.feed_forward = nn.Sequential(
-                nn.Linear(config.hidden_size, config.intermediate_size),
-                nn.GELU(),
-                nn.Linear(config.intermediate_size, config.hidden_size),
-                nn.Dropout(config.dropout),
-            )
-        
-        self.dropout = nn.Dropout(config.dropout)
+            # Standard MLP (replace with TE Linear)
+            # Note: TE Linear doesn't include activation/dropout, apply separately
+            self.ffn_linear1 = te.Linear(config.hidden_size, config.intermediate_size)
+            self.ffn_activation = nn.GELU() # Keep standard activation
+            self.ffn_dropout1 = nn.Dropout(config.dropout) # Keep standard dropout
+            self.ffn_linear2 = te.Linear(config.intermediate_size, config.hidden_size)
+            self.ffn_dropout2 = nn.Dropout(config.dropout) # Dropout after second linear
+
+        # self.dropout = nn.Dropout(config.dropout) # Now handled within MLP/Attention
     
     def forward(
         self,
-        hidden_states,
-        position_ids,
+        hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None, # Add attention_mask back
-        cos=None,
-        sin=None,
-        # Paged KV cache arguments
-        kv_cache=None,
-        block_table=None,
-        cache_seqlens=None,
-        output_attentions=False,
-        # use_cache is implicit
+        position_ids: Optional[torch.LongTensor] = None, # Add position_ids back
+        cos: Optional[torch.Tensor] = None, # Add cos
+        sin: Optional[torch.Tensor] = None, # Add sin
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, # Use standard past_key_value format
+        output_attentions: bool = False,
+        use_cache: bool = False, # Add use_cache flag
     ):
         residual = hidden_states
-        
         # Self-attention
-        hidden_states = self.ln_1(hidden_states)
-        
+        # TE LayerNorm handles precision internally when used with fp8_autocast
+        hidden_states_ln = self.ln_1(hidden_states)
+
         if self.config.use_mla:
-            attention_outputs = self.attention(
-                hidden_states=hidden_states,
-                position_ids=position_ids,
-                # Removed duplicate hidden_states and position_ids arguments
+            # MLA path expects hidden_states, cos, sin, attention_mask, position_ids, past_key_value
+            attn_output, attn_weights, present_key_value = self.attention(
+                hidden_states=hidden_states_ln,
                 cos=cos,
                 sin=sin,
-                kv_cache=kv_cache, # Pass Paged KV cache parts for the current layer
-                block_table=block_table,
-                cache_seqlens=cache_seqlens,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value, # Passed but may not be used effectively by MLA
                 output_attentions=output_attentions,
-                # layer_idx is implicitly passed via self.attention instance
+                use_cache=use_cache,
             )
-            # Output signature: (attn_output, attn_weights, past_key_value)
-            # FlashMLA returns (attn_output, None, None)
-            attn_output = attention_outputs[0]
-            attn_weights = attention_outputs[1] # Will be None
-            
-            # Add outputs depending on configuration
-            outputs = (attn_output,)
-            if output_attentions:
-                 # FlashMLA doesn't return weights, append None or handle differently
-                outputs += (attn_weights,) # Appending None
-            # Cache is managed externally via kv_cache, block_table, cache_seqlens
-            # No past_key_value tuple is returned by the attention layer anymore
+            # Note: present_key_value from MLA FlashAttention impl is currently None
         else:
-            # Standard attention path - needs similar cache handling update if MLA is disabled
-            # For simplicity, assuming use_mla=True is the primary path
-            # Convert attention mask from [batch_size, seq_len] to attention format
-            # Note: FlashAttention/FlashMLA typically handle causal masking internally
-            if attention_mask is not None: # This mask might still be needed for padding
-                # Convert to float and invert (1->0, 0->-inf)
-                attn_mask = (1.0 - attention_mask.unsqueeze(1)) * -10000.0
-            else:
-                attn_mask = None
-            
+            # Standard multi-head attention path
+            # nn.MultiheadAttention expects query, key, value
+            # It doesn't directly use cos, sin, position_ids in its signature
+            # RoPE would need to be applied *before* passing to standard MHA if needed
+            # Also, standard MHA doesn't return past_key_value tuple directly
             attn_output, attn_weights = self.attention(
-                hidden_states, hidden_states, hidden_states,
-                attn_mask=attn_mask, # May need adjustment for standard attention with Paged KV
+                hidden_states_ln, # query
+                hidden_states_ln, # key
+                hidden_states_ln, # value
+                key_padding_mask=attention_mask[:, 0, 0, :] if attention_mask is not None and attention_mask.dim() == 4 else None, # Adjust mask format if needed
+                attn_mask=attention_mask, # Pass the 4D mask if appropriate for MHA variant
                 need_weights=output_attentions,
-                # Add cache arguments here if modifying standard attention
+                # Cache handling needs external management for standard nn.MultiheadAttention
             )
-            
-            outputs = (attn_output,)
-            if output_attentions:
-                outputs += (attn_weights,)
-            # No past_key_value tuple returned
-        
+            # Standard MHA doesn't return cache, set present_key_value to None
+            present_key_value = None # Standard MHA doesn't return cache in this format
+
         # Residual connection
-        hidden_states = residual + self.dropout(outputs[0])
-        
+        # Note: TE Linear layers often don't need explicit dropout after them if using TE's built-in dropout fusion
+        # Check TE documentation if dropout is fused in te.Linear or needs separate application.
+        # Assuming separate dropout for now.
+        hidden_states = residual + attn_output # Apply residual (dropout might be handled in o_proj or later)
         # Feed-forward (MLP or PEER)
         residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)
-        hidden_states = self.feed_forward(hidden_states)
+        # TE LayerNorm handles precision
+        hidden_states_ln = self.ln_2(hidden_states)
+
+        # Apply MLP/PEER
+        if isinstance(self.feed_forward, PEER):
+             hidden_states = self.feed_forward(hidden_states_ln)
+        else:
+             # Apply standard MLP using TE layers
+             hidden_states = self.ffn_linear1(hidden_states_ln)
+             hidden_states = self.ffn_activation(hidden_states)
+             hidden_states = self.ffn_dropout1(hidden_states)
+             hidden_states = self.ffn_linear2(hidden_states)
+             hidden_states = self.ffn_dropout2(hidden_states)
+
+        # Apply residual
         hidden_states = residual + hidden_states
-        
-        # Return signature adjusted: (hidden_states, attn_weights [None])
-        return (hidden_states,) + outputs[1:]
 
-
-# Placeholder for Paged KV Cache management logic
-# Needs actual implementation based on chosen library/approach (e.g., vLLM's PagedAttention)
-
-# Expected cache shapes based on FlashMLA interface (assuming block_size=64):
-# k_cache: (num_blocks, 64, num_heads, k_head_dim)
-# v_cache: (num_blocks, 64, num_heads, v_head_dim)
-# OR potentially packed: kv_cache: (num_blocks, 2, 64, num_heads, head_dim) - Needs clarification!
-
-def init_paged_kv_cache(config, batch_size, max_seq_len, device):
-    """
-    Initializes the Paged KV Cache tensors.
-    This needs a concrete implementation based on the chosen PagedAttention library or logic.
-    It should allocate the cache tensors (k_cache, v_cache or packed kv_cache) and
-    the initial block_table and cache_seqlens.
-    """
-    print("Warning: Paged KV Cache initialization logic (init_paged_kv_cache) is a placeholder.")
-    # Example placeholder dimensions (adjust based on actual cache structure)
-    num_layers = config.num_hidden_layers
-    num_heads = config.num_attention_heads
-    # Assuming k_head_dim = q_head_dim from MLA config
-    k_head_dim = config.mla_config.get("qk_nope_head_dim", 128) + config.mla_config.get("qk_rope_head_dim", 64)
-    v_head_dim = config.mla_config.get("v_head_dim", 128)
-    block_size = 64 # From FlashMLA README
-    # num_blocks needs estimation based on max_seq_len, batch_size, and available memory
-    num_blocks = 2048 # Example placeholder
-
-    # Placeholder cache tensors (replace with actual allocation)
-    # Separate K and V caches as expected by FlashMLA C++ backend
-    k_cache = torch.zeros((num_blocks, block_size, num_heads, k_head_dim), dtype=torch.float16, device=device)
-    v_cache = torch.zeros((num_blocks, block_size, num_heads, v_head_dim), dtype=torch.float16, device=device)
-    # Placeholder block table and sequence lengths
-    max_num_blocks_per_seq = (max_seq_len + block_size - 1) // block_size
-    block_table = torch.zeros((batch_size, max_num_blocks_per_seq), dtype=torch.int32, device=device)
-    cache_seqlens = torch.zeros((batch_size,), dtype=torch.int32, device=device)
-
-    # Return separate K and V caches, block table, and sequence lengths
-    return k_cache, v_cache, block_table, cache_seqlens
-
-
-def update_paged_kv_cache(k_cache, v_cache, block_table, cache_seqlens, key, value, layer_idx):
-    """
-    Writes the current key and value tensors into the Paged KV cache.
-    This needs a concrete implementation using the block_table to find the
-    correct physical blocks and offsets based on cache_seqlens.
-    The layer_idx might be needed if the cache tensors include the layer dimension.
-    """
-    # key shape: (bsz, num_heads, q_len, k_head_dim)
-    # value shape: (bsz, num_heads, q_len, v_head_dim)
-    # k_cache shape: (num_blocks, block_size, num_heads, k_head_dim)
-    # v_cache shape: (num_blocks, block_size, num_heads, v_head_dim)
-    # block_table shape: (bsz, max_num_blocks_per_seq)
-    # cache_seqlens shape: (bsz,)
-    print(f"Warning: Paged KV Cache update logic (update_paged_kv_cache) for layer {layer_idx} is a placeholder.")
-    # --- Implementation needed here ---
-    # Example steps:
-    # 1. Determine target block indices and offsets using block_table and cache_seqlens.
-    # 2. Reshape/scatter the key and value tensors into the kv_cache tensor at the calculated positions.
-    pass
+        # Return signature: (hidden_states, present_key_value, optional_attn_weights)
+        outputs = (hidden_states, present_key_value)
+        if output_attentions:
+            outputs += (attn_weights,)
+        return outputs
 
 
 class FoundationModel(nn.Module):
@@ -299,23 +241,29 @@ class FoundationModel(nn.Module):
         self.wte = nn.Embedding(config.vocab_size, config.hidden_size)
         
         # Positional embeddings for rotary attention
+        # Use qk_rope_head_dim if MLA is enabled, otherwise calculate based on hidden_size/num_heads
+        rope_dim = config.hidden_size // config.num_attention_heads # Default for standard attention
+        if config.use_mla and config.mla_config:
+            rope_dim = config.mla_config.get("qk_rope_head_dim", 64)
+
         self.wpe = PositionalEmbedding(
-            dim=config.mla_config.get("qk_rope_head_dim", 64) if config.use_mla else config.hidden_size // 2,
+            dim=rope_dim,
             max_seq_len=config.max_position_embeddings,
+            base=config.mla_config.get("rope_theta", 10000.0) # Use theta from mla_config if available
         )
-        
+
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(config, layer_idx) 
+            TransformerBlock(config, layer_idx)
             for layer_idx in range(config.num_hidden_layers)
         ])
-        
-        # Final layer norm
-        self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
-        # Head for language modeling
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        
+
+        # Final layer norm (replace with TE LayerNorm)
+        self.ln_f = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        # Head for language modeling (replace with TE Linear)
+        self.lm_head = te.Linear(config.hidden_size, config.vocab_size, bias=False)
+
         # Initialize weights
         self.apply(self._init_weights)
         
@@ -361,99 +309,111 @@ class FoundationModel(nn.Module):
         else:
             raise ValueError("Either input_ids or inputs_embeds must be provided.")
 
-        # Initialize Paged KV Cache if use_cache is True and cache is not provided
-        # This logic depends heavily on how generation is handled externally
-        is_decode_phase = past_key_values is not None # Use past_key_values presence to infer phase
+        # Handle KV cache
+        past_key_values_length = 0
         if use_cache:
-             if is_decode_phase:
-                 # Assume past_key_values now contains the necessary cache structures
-                 # Unpack separate K and V caches
-                 k_cache, v_cache, block_table, cache_seqlens = past_key_values
-             else: # Prefill phase
-                 # Initialize Paged KV Cache structure
-                 # max_length needs to be determined (e.g., from config or generation params)
-                 max_length = self.config.max_position_embeddings # Example
-                 k_cache, v_cache, block_table, cache_seqlens = init_paged_kv_cache(
-                     self.config, batch_size, max_length, device
-                 )
-                 # Prefill phase uses full seq_length
-                 # Decode phase uses seq_length=1, cache_seqlens tracks actual lengths
+            # Check if past_key_values is provided and is a tuple
+            if past_key_values is not None and isinstance(past_key_values, tuple):
+                 # Assuming past_key_values is a tuple of tuples for each layer
+                 # (layer_past_k, layer_past_v)
+                 if len(past_key_values) > 0 and len(past_key_values[0]) > 0:
+                     past_key_values_length = past_key_values[0][0].shape[2] # Get seq length from first layer's key cache
+            # Initialize past_key_values tuple if needed
+            if past_key_values is None:
+                 past_key_values = tuple([None] * len(self.blocks))
         else:
-            k_cache, v_cache, block_table, cache_seqlens = None, None, None, None
-
-        # Initialize return values
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-        # next_decoder_cache tuple is replaced by the updated Paged KV cache structures
+            past_key_values = None
 
         # Generate default position IDs if not provided
-        # Handle position_ids based on prefill/decode phase if using cache
         if position_ids is None:
-             if is_decode_phase:
-                 # Decode phase: position is the current total length
-                 current_length = cache_seqlens[0].item() # Assuming uniform length for simplicity
-                 position_ids = torch.tensor([[current_length]], dtype=torch.long, device=device)
-                 seq_length = 1 # Decode phase processes one token at a time
-             else: # Prefill phase
-                 position_ids = torch.arange(seq_length, dtype=torch.long, device=device).unsqueeze(0)
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        else:
+            # Ensure position_ids are correctly shaped if provided
+            position_ids = position_ids.view(-1, seq_length).long()
 
         # Get embeddings
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        
-        # Generate positional embeddings
-        cos, sin = self.wpe(seq_length)
-        
-        # Create causal attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=device)
-        
+
+        # Generate positional embeddings (cos, sin caches)
+        # Pass the required sequence length which might include past length
+        cos, sin = self.wpe(seq_len=seq_length + past_key_values_length)
+        # Slice cos/sin based on the maximum position ID needed for this pass
+        max_pos = position_ids.max()
+        cos = cos[:max_pos + 1]
+        sin = sin[:max_pos + 1]
+
+
+        # Prepare causal attention mask
+        # Standard Hugging Face causal mask preparation
+        # This assumes `attention_mask` is the padding mask (1 for real tokens, 0 for padding)
+        _attn_implementation = self.config.mla_config.get("_attn_implementation", "eager") # Check config if available
+        if _attn_implementation == "flash_attention_2":
+             # Flash Attention handles causal masking internally based on seq lengths.
+             # Pass the 2D padding mask directly.
+             if attention_mask is not None and 0 not in attention_mask:
+                 # If no padding, pass None to use internal causal masking
+                 attention_mask = None
+        else:
+             # Prepare 4D causal mask for standard attention
+             from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+             attention_mask = _prepare_4d_causal_attention_mask(
+                 attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+             )
+
         # Prepare for attention
         hidden_states = inputs_embeds
-        
+        next_decoder_cache = () if use_cache else None
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
         # Apply transformer blocks
         for i, block in enumerate(self.blocks):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            # Get the Paged KV cache specific to the layer if needed, or pass the whole structure
-            # Assuming the block expects the full cache structure to manage internally or via the attention layer
-            
-            layer_outputs = block(
-                hidden_states,
-                position_ids=position_ids,
-                # attention_mask might still be needed for padding in prefill, but causal handled by FlashMLA
-                cos=cos,
-                sin=sin,
-                k_cache=k_cache, # Pass K cache
-                v_cache=v_cache, # Pass V cache
-                block_table=block_table,
-                cache_seqlens=cache_seqlens,
-                output_attentions=output_attentions,
-            )
-            
-            hidden_states = layer_outputs[0]
-            
-            # Update cache_seqlens after first layer in decode phase
-            # This logic needs careful placement depending on cache update strategy
-            if use_cache and is_decode_phase and i == 0:
-                 cache_seqlens += 1
+            # Get past key value for the current layer from the tuple
+            layer_past_key_value = past_key_values[i] if past_key_values is not None else None
 
+            layer_outputs = block(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids, # Pass position_ids
+                past_key_value=layer_past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cos=cos, # Pass RoPE caches
+                sin=sin,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            # Handle cache collection
+            if use_cache:
+                 # layer_outputs[1] contains the present_key_value (kv_c, k_pe) for MLA
+                 # or None for standard MHA in this setup
+                 next_decoder_cache += (layer_outputs[1],)
+
+            # Handle attention weights collection
             if output_attentions:
-                # layer_outputs[1] will be None from FlashMLA
-                all_self_attns = all_self_attns + (layer_outputs[1],)
-            
-            # Cache is managed via passed structures, no tuple to collect
-        
-        # Final layer norm
+                 # Attention weights are the last element if cache is used, otherwise second
+                 attn_weights_idx = 2 if use_cache and layer_outputs[1] is not None else 1
+                 if len(layer_outputs) > attn_weights_idx:
+                     all_self_attns += (layer_outputs[attn_weights_idx],)
+                 else:
+                     all_self_attns += (None,) # Add None if weights weren't returned
+
+        # Final layer norm (TE LayerNorm handles precision)
         hidden_states = self.ln_f(hidden_states)
-        
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
-        
-        # Language modeling head
+
+        # Language modeling head (TE Linear)
         lm_logits = self.lm_head(hidden_states)
-        
+
         # Calculate loss if labels are provided
         loss = None
         if labels is not None:
@@ -471,27 +431,20 @@ class FoundationModel(nn.Module):
                  "loss": loss,
                  "logits": lm_logits,
                  "hidden_states": all_hidden_states,
-                 "attentions": all_self_attns, # Will contain Nones if output_attentions=True
+                 "logits": lm_logits,
+                 "past_key_values": next_decoder_cache, # Return standard cache tuple
+                 "hidden_states": all_hidden_states,
+                 "attentions": all_self_attns,
              }
-             if use_cache:
-                 # Return the updated cache structures
-                 # Pack K and V caches along with block_table and cache_seqlens
-                 output_dict["past_key_values"] = (k_cache, v_cache, block_table, cache_seqlens)
              return output_dict
         else:
-            outputs = (lm_logits,)
-            if use_cache:
-                 # Return updated cache structures
-                 # Pack K and V caches along with block_table and cache_seqlens
-                 outputs = outputs + ((k_cache, v_cache, block_table, cache_seqlens),)
-            if output_hidden_states:
-                outputs = outputs + (all_hidden_states,)
-            if output_attentions:
-                outputs = outputs + (all_self_attns,)
-            
+            outputs = (lm_logits,) + (next_decoder_cache,) + (all_hidden_states,) + (all_self_attns,)
+            # Filter out None values
+            outputs = tuple(v for v in outputs if v is not None)
+
             if loss is not None:
                 outputs = (loss,) + outputs
-            
+
             return outputs
 
 
