@@ -524,20 +524,59 @@ def evaluate_checkpoint(
         else:
             # Load perplexity results
             if os.path.exists(perplexity_results_path):
-                with open(perplexity_results_path, "r") as f:
-                    perplexity_data = json.load(f)
-                    # Handle different possible key structures in perplexity output
-                    if "perplexity" in perplexity_data:
-                        results["perplexity"] = perplexity_data["perplexity"]
-                    elif "validation_perplexity" in perplexity_data:
-                        results["perplexity"] = perplexity_data["validation_perplexity"]
-                    else:
-                        # Try to find any key containing 'perplexity'
-                        perplexity_keys = [k for k in perplexity_data.keys() if 'perplexity' in k.lower()]
-                        if perplexity_keys:
-                            results["perplexity"] = perplexity_data[perplexity_keys[0]]
-                        else:
+                try:
+                    with open(perplexity_results_path, "r") as f:
+                        perplexity_data = json.load(f)
+                            
+                        # Handle different possible key structures in perplexity output
+                        # Define a priority list of keys to check
+                        perplexity_key_candidates = [
+                            "perplexity",
+                            "validation_perplexity",
+                            "test_perplexity",
+                            "eval_perplexity",
+                            "ppl",
+                            "validation_ppl",
+                        ]
+                            
+                        # Try each key in order
+                        found_key = False
+                        for key in perplexity_key_candidates:
+                            if key in perplexity_data:
+                                results["perplexity"] = perplexity_data[key]
+                                found_key = True
+                                break
+                            
+                        # If not found, check nested dictionaries
+                        if not found_key:
+                            for section in ["metrics", "results", "validation", "eval"]:
+                                if section in perplexity_data and isinstance(perplexity_data[section], dict):
+                                    for key in perplexity_key_candidates:
+                                        if key in perplexity_data[section]:
+                                            results["perplexity"] = perplexity_data[section][key]
+                                            found_key = True
+                                            break
+                                    if found_key:
+                                        break
+                            
+                        # Last resort: try to find any key containing 'perplexity'
+                        if not found_key:
+                            perplexity_keys = [k for k in perplexity_data.keys() if 'perplexity' in k.lower()]
+                            if perplexity_keys:
+                                results["perplexity"] = perplexity_data[perplexity_keys[0]]
+                                found_key = True
+                            
+                        # If still not found, use infinity
+                        if not found_key:
+                            print(f"Warning: Could not find perplexity value in results file: {perplexity_results_path}")
+                            print(f"Available keys: {list(perplexity_data.keys())}")
                             results["perplexity"] = float("inf")
+                except json.JSONDecodeError:
+                    print(f"Error: Could not parse JSON from {perplexity_results_path}")
+                    results["perplexity"] = float("inf")
+                except Exception as e:
+                    print(f"Error processing perplexity results: {e}")
+                    results["perplexity"] = float("inf")
             else:
                 results["perplexity"] = float("inf")
     except Exception as e:
@@ -607,40 +646,81 @@ def evaluate_checkpoint(
             else:
                 # Load benchmark results
                 if os.path.exists(benchmark_results_path):
-                    with open(benchmark_results_path, "r") as f:
-                        benchmark_data = json.load(f)
+                    try:
+                        with open(benchmark_results_path, "r") as f:
+                            benchmark_data = json.load(f)
 
-                        # Extract the primary metric from the benchmark results
-                        # Handle different possible JSON structures
-                        if benchmark_name == "codeforces":
-                            # Special handling for codeforces which has multiple metrics
-                            results[benchmark_name] = benchmark_data.get("percentile", None)
-                            results[f"{benchmark_name}_rating"] = benchmark_data.get("rating", None)
-                        else:
-                            # Try different possible locations for the metric
-                            # 1. Direct key access
-                            if primary_metric_key in benchmark_data:
-                                results[benchmark_name] = benchmark_data[primary_metric_key]
-                            # 2. Check if metrics is a dict containing our key
-                            elif "metrics" in benchmark_data and isinstance(benchmark_data["metrics"], dict):
-                                results[benchmark_name] = benchmark_data["metrics"].get(primary_metric_key, None)
-                            # 3. Check if results contains our key
-                            elif "results" in benchmark_data and isinstance(benchmark_data["results"], dict):
-                                results[benchmark_name] = benchmark_data["results"].get(primary_metric_key, None)
-                            # 4. Look for any key containing our metric name
+                            # Extract the primary metric from the benchmark results
+                            # Handle different possible JSON structures
+                            if benchmark_name == "codeforces":
+                                # Special handling for codeforces which has multiple metrics
+                                results[benchmark_name] = benchmark_data.get("percentile", None)
+                                results[f"{benchmark_name}_rating"] = benchmark_data.get("rating", None)
+                                
+                                # Check nested structures if not found at top level
+                                if results[benchmark_name] is None and "metrics" in benchmark_data:
+                                    results[benchmark_name] = benchmark_data["metrics"].get("percentile", None)
+                                    results[f"{benchmark_name}_rating"] = benchmark_data["metrics"].get("rating", None)
                             else:
-                                metric_keys = [k for k in benchmark_data.keys() 
-                                              if primary_metric_key.lower() in k.lower()]
-                                if metric_keys:
-                                    results[benchmark_name] = benchmark_data[metric_keys[0]]
-                                else:
+                                # Define a list of common locations to check for the metric
+                                found_metric = False
+                                
+                                # 1. Direct key access
+                                if primary_metric_key in benchmark_data:
+                                    results[benchmark_name] = benchmark_data[primary_metric_key]
+                                    found_metric = True
+                                # 2. Check if metrics is a dict containing our key
+                                elif "metrics" in benchmark_data and isinstance(benchmark_data["metrics"], dict):
+                                    if primary_metric_key in benchmark_data["metrics"]:
+                                        results[benchmark_name] = benchmark_data["metrics"][primary_metric_key]
+                                        found_metric = True
+                                # 3. Check if results contains our key
+                                elif "results" in benchmark_data and isinstance(benchmark_data["results"], dict):
+                                    if primary_metric_key in benchmark_data["results"]:
+                                        results[benchmark_name] = benchmark_data["results"][primary_metric_key]
+                                        found_metric = True
+                                # 4. Check for "score" key if primary_metric_key not found
+                                elif "score" in benchmark_data:
+                                    results[benchmark_name] = benchmark_data["score"]
+                                    found_metric = True
+                                elif "metrics" in benchmark_data and isinstance(benchmark_data["metrics"], dict) and "score" in benchmark_data["metrics"]:
+                                    results[benchmark_name] = benchmark_data["metrics"]["score"]
+                                    found_metric = True
+                                # 5. Look for any key containing our metric name
+                                if not found_metric:
+                                    metric_keys = [k for k in benchmark_data.keys() 
+                                                if primary_metric_key.lower() in k.lower()]
+                                    if metric_keys:
+                                        results[benchmark_name] = benchmark_data[metric_keys[0]]
+                                        found_metric = True
+                                    else:
+                                        # Last resort: look for any key that might be a metric
+                                        potential_metric_keys = ["accuracy", "score", "f1", "exact_match", "pass_rate", "success_rate"]
+                                        for key in potential_metric_keys:
+                                            if key in benchmark_data:
+                                                results[benchmark_name] = benchmark_data[key]
+                                                found_metric = True
+                                                print(f"Note: Using '{key}' as metric for {benchmark_name} instead of '{primary_metric_key}'")
+                                                break
+                                
+                                if not found_metric:
+                                    print(f"Warning: Could not find metric '{primary_metric_key}' for benchmark {benchmark_name}")
+                                    print(f"Available keys: {list(benchmark_data.keys())}")
+                                    if "metrics" in benchmark_data:
+                                        print(f"Available metrics: {list(benchmark_data['metrics'].keys()) if isinstance(benchmark_data['metrics'], dict) else benchmark_data['metrics']}")
                                     results[benchmark_name] = None
-                            
-                            # Extract additional metrics if present
-                            if "metrics" in benchmark_data and isinstance(benchmark_data["metrics"], dict):
-                                for metric_name, value in benchmark_data["metrics"].items():
-                                    if metric_name != primary_metric_key:
-                                        results[f"{benchmark_name}_{metric_name}"] = value
+                                
+                                # Extract additional metrics if present
+                                if "metrics" in benchmark_data and isinstance(benchmark_data["metrics"], dict):
+                                    for metric_name, value in benchmark_data["metrics"].items():
+                                        if metric_name != primary_metric_key:
+                                            results[f"{benchmark_name}_{metric_name}"] = value
+                    except json.JSONDecodeError:
+                        print(f"Error: Could not parse JSON from {benchmark_results_path}")
+                        results[benchmark_name] = None
+                    except Exception as e:
+                        print(f"Error processing benchmark results for {benchmark_name}: {e}")
+                        results[benchmark_name] = None
                 else:
                     results[benchmark_name] = None
         except subprocess.TimeoutExpired:

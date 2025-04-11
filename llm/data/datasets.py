@@ -84,25 +84,103 @@ def prepare_datasets(config: Dict) -> IterableDataset:
             # Map to standardize the text field name
             text_field = dataset_info.get("text_field", "text")
 
+            # First, check the dataset schema to see what fields are available
+            try:
+                # Get a sample to examine the schema
+                sample = next(iter(dataset.take(1)))
+                available_fields = list(sample.keys())
+                
+                # Log available fields for debugging
+                logger.info(f"Dataset {dataset_info['name']} has fields: {available_fields}")
+                
+                # Verify if the specified text field exists
+                if text_field not in available_fields:
+                    # Try to find alternative text fields
+                    text_field_candidates = ["text", "content", "document", "passage", "context", "input", "instruction", "query", "question", "code"]
+                    
+                    # Find the first matching field
+                    alternative_field = None
+                    for field in text_field_candidates:
+                        if field in available_fields:
+                            alternative_field = field
+                            break
+                    
+                    # If no standard field found, look for string fields with substantial content
+                    if alternative_field is None:
+                        for field, value in sample.items():
+                            if isinstance(value, str) and len(value) > 100:  # More conservative threshold
+                                alternative_field = field
+                                break
+                    
+                    if alternative_field:
+                        logger.warning(
+                            f"Specified text field '{text_field}' not found in dataset {dataset_info['name']}. "
+                            f"Using '{alternative_field}' instead. Please update your configuration."
+                        )
+                        text_field = alternative_field
+                    else:
+                        logger.error(
+                            f"Could not find suitable text field in dataset {dataset_info['name']}. "
+                            f"Available fields: {available_fields}. Please specify the correct text_field in your configuration."
+                        )
+                        # Skip this dataset instead of using empty strings
+                        continue
+            except Exception as e:
+                logger.warning(f"Error examining dataset schema for {dataset_info['name']}: {e}")
+                # Continue with the specified text_field and hope for the best
+
             def map_fn(example):
                 # Check if text field exists
                 if text_field in example:
-                    return {"text": example[text_field]}
-
-                # If text field doesn't exist, try to find a suitable text field
-                potential_fields = [k for k, v in example.items() if isinstance(v, str) and len(v) > 50] # Heuristic: look for longer string fields
+                    text_content = example[text_field]
+                    # Verify the content is a string and not empty
+                    if isinstance(text_content, str) and text_content.strip():
+                        return {"text": text_content}
+                    else:
+                        logger.warning(f"Text field '{text_field}' exists but contains non-string or empty content in dataset {dataset_info['name']}.")
+                
+                # If we get here, either the field doesn't exist or has invalid content
+                # Try to find any suitable text field as a fallback
+                potential_fields = [
+                    (k, v) for k, v in example.items() 
+                    if isinstance(v, str) and len(v.strip()) > 50
+                ]
+                
                 if potential_fields:
-                    chosen_field = potential_fields[0] # Pick the first one found
-                    logger.warning(f"Text field '{text_field}' not found in dataset {dataset_info['name']}. Using field '{chosen_field}' instead.")
-                    return {"text": example[chosen_field]}
+                    # Sort by length to get the field with the most content
+                    potential_fields.sort(key=lambda x: len(x[1]), reverse=True)
+                    chosen_field, content = potential_fields[0]
+                    logger.warning(
+                        f"Using fallback field '{chosen_field}' for dataset {dataset_info['name']}. "
+                        f"Please update your configuration."
+                    )
+                    return {"text": content}
                 else:
-                    # If no suitable field found, return empty text and log warning
-                    logger.warning(f"Could not find suitable text field in dataset {dataset_info['name']}. Returning empty text.")
+                    # If no suitable field found, log error and return empty text
+                    # This will create essentially empty examples that should be filtered out
+                    logger.error(
+                        f"No suitable text content found in example from dataset {dataset_info['name']}. "
+                        f"Fields: {list(example.keys())}"
+                    )
                     return {"text": ""}
 
+            # Map to standardize text field and then filter out empty examples
             dataset = dataset.map(map_fn)
-
-            datasets.append(dataset)
+            
+            # Filter out empty examples
+            def filter_empty(example):
+                return example["text"] != "" and len(example["text"].strip()) > 0
+            
+            filtered_dataset = dataset.filter(filter_empty)
+            
+            # Log how many examples were filtered out (if possible)
+            try:
+                # This might not work for all streaming datasets
+                logger.info(f"Dataset {dataset_info['name']} ready for training")
+            except Exception:
+                pass  # Skip count logging for streaming datasets
+            
+            datasets.append(filtered_dataset)
             weights.append(dataset_info.get("weight", 1.0))
 
             logger.info(
