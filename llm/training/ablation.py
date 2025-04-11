@@ -38,7 +38,7 @@ ABLATION_CONFIGS = {
                 {
                     "name": "fineweb",
                     "path": "HuggingFaceFW/fineweb",
-                    "name": "sample/10BT", # Specify subset for FineWeb
+                    "subset": "sample/10BT", # Specify subset for FineWeb
                     "split": "train",
                     "streaming": True,
                     "weight": 0.6,
@@ -47,7 +47,7 @@ ABLATION_CONFIGS = {
                 {
                     "name": "wikipedia",
                     "path": "wikimedia/wikipedia",
-                    "name": "20231101.en", # Specify Wikipedia dump version
+                    "subset": "20231101.en", # Specify Wikipedia dump version
                     "split": "train",
                     "streaming": True,
                     "weight": 0.2,
@@ -77,7 +77,7 @@ ABLATION_CONFIGS = {
                 {
                     "name": "fineweb",
                     "path": "HuggingFaceFW/fineweb",
-                    "name": "sample/10BT",
+                    "subset": "sample/10BT",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.3,
@@ -102,7 +102,7 @@ ABLATION_CONFIGS = {
                  {
                     "name": "wikipedia",
                     "path": "wikimedia/wikipedia",
-                    "name": "20231101.en",
+                    "subset": "20231101.en",
                     "split": "train",
                     "streaming": True,
                     "weight": 0.1,
@@ -355,11 +355,18 @@ def run_training(
     print(f"Starting training for experiment: {experiment_name}")
     print(f"Command: {' '.join(cmd)}")
 
-    with open(log_path, "w") as log_file:
-        process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+    # Ensure the log directory exists
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
-        # Wait for process to complete
-        process.wait()
+    try:
+        with open(log_path, "w") as log_file:
+            process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            
+            # Wait for process to complete
+            process.wait()
+    except Exception as e:
+        print(f"Error executing training command: {e}")
+        return log_path, None
 
     # Check if training completed successfully
     if process.returncode != 0:
@@ -435,6 +442,18 @@ def evaluate_checkpoint(
     if not os.path.exists(size_script_path):
         # Fallback if structure assumption is wrong, try relative from project root
         size_script_path = "llm/utils/eval/size.py"
+        
+    # Check if the script exists at either location
+    if not os.path.exists(size_script_path):
+        print(f"WARNING: Model analyzer script not found at {size_script_path}")
+        print("Skipping model analysis step")
+        # Add basic parameter info to results without running analysis
+        results.update({
+            "total_params": 0,
+            "active_params": 0,
+            "active_params_ratio": 0,
+        })
+        return results
 
     cmd = [
         "python",
@@ -507,9 +526,18 @@ def evaluate_checkpoint(
             if os.path.exists(perplexity_results_path):
                 with open(perplexity_results_path, "r") as f:
                     perplexity_data = json.load(f)
-                    results["perplexity"] = perplexity_data.get(
-                        "perplexity", float("inf")
-                    )
+                    # Handle different possible key structures in perplexity output
+                    if "perplexity" in perplexity_data:
+                        results["perplexity"] = perplexity_data["perplexity"]
+                    elif "validation_perplexity" in perplexity_data:
+                        results["perplexity"] = perplexity_data["validation_perplexity"]
+                    else:
+                        # Try to find any key containing 'perplexity'
+                        perplexity_keys = [k for k in perplexity_data.keys() if 'perplexity' in k.lower()]
+                        if perplexity_keys:
+                            results["perplexity"] = perplexity_data[perplexity_keys[0]]
+                        else:
+                            results["perplexity"] = float("inf")
             else:
                 results["perplexity"] = float("inf")
     except Exception as e:
@@ -583,22 +611,36 @@ def evaluate_checkpoint(
                         benchmark_data = json.load(f)
 
                         # Extract the primary metric from the benchmark results
-                        # Adjust extraction logic based on actual output JSON structure of llm-eval
+                        # Handle different possible JSON structures
                         if benchmark_name == "codeforces":
-                            results[benchmark_name] = benchmark_data.get(
-                                "percentile", None
-                            )
-                            results[f"{benchmark_name}_rating"] = benchmark_data.get(
-                                "rating", None
-                            )
+                            # Special handling for codeforces which has multiple metrics
+                            results[benchmark_name] = benchmark_data.get("percentile", None)
+                            results[f"{benchmark_name}_rating"] = benchmark_data.get("rating", None)
                         else:
-                            # Extract the primary metric specified or a default
-                            results[benchmark_name] = benchmark_data.get(
-                                primary_metric_key, None
-                            )
-                            # Optionally extract other relevant metrics if needed
-                            # e.g., if benchmark_data contains {'accuracy': 0.8, 'f1': 0.75}
-                            # results[f"{benchmark_name}_f1"] = benchmark_data.get("f1", None)
+                            # Try different possible locations for the metric
+                            # 1. Direct key access
+                            if primary_metric_key in benchmark_data:
+                                results[benchmark_name] = benchmark_data[primary_metric_key]
+                            # 2. Check if metrics is a dict containing our key
+                            elif "metrics" in benchmark_data and isinstance(benchmark_data["metrics"], dict):
+                                results[benchmark_name] = benchmark_data["metrics"].get(primary_metric_key, None)
+                            # 3. Check if results contains our key
+                            elif "results" in benchmark_data and isinstance(benchmark_data["results"], dict):
+                                results[benchmark_name] = benchmark_data["results"].get(primary_metric_key, None)
+                            # 4. Look for any key containing our metric name
+                            else:
+                                metric_keys = [k for k in benchmark_data.keys() 
+                                              if primary_metric_key.lower() in k.lower()]
+                                if metric_keys:
+                                    results[benchmark_name] = benchmark_data[metric_keys[0]]
+                                else:
+                                    results[benchmark_name] = None
+                            
+                            # Extract additional metrics if present
+                            if "metrics" in benchmark_data and isinstance(benchmark_data["metrics"], dict):
+                                for metric_name, value in benchmark_data["metrics"].items():
+                                    if metric_name != primary_metric_key:
+                                        results[f"{benchmark_name}_{metric_name}"] = value
                 else:
                     results[benchmark_name] = None
         except subprocess.TimeoutExpired:
@@ -656,6 +698,14 @@ def generate_experiment_combinations(selected_axes: List[str] = None) -> List[Di
 
     return combinations
 
+
+def ensure_file_exists(file_path, error_message=None):
+    """Check if a file exists and print a helpful message if it doesn't."""
+    if file_path and not os.path.exists(file_path):
+        msg = error_message or f"File not found: {file_path}"
+        print(f"WARNING: {msg}")
+        return False
+    return True
 
 def add_custom_dataset_mixes(ablation_configs, custom_datasets_path=None):
     """
@@ -767,18 +817,17 @@ def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
 
     # 1. Analyze by number of parameters vs. perplexity
     plt.figure(figsize=(12, 8))
-    sns.scatterplot(
-        data=df,
-        x="total_params",
-        y="perplexity",
-        data=df,
-        x="total_params",
-        y="perplexity",
-        hue="experiment_type", # Color by the combination of axes tested
-        size="active_params_ratio",
-        sizes=(100, 400),
-        alpha=0.7,
-    )
+    # Check if required columns exist
+    if "total_params" in df.columns and "perplexity" in df.columns:
+        sns.scatterplot(
+            data=df,
+            x="total_params",
+            y="perplexity",
+            hue="experiment_type" if "experiment_type" in df.columns else None, # Color by the combination of axes tested
+            size="active_params_ratio" if "active_params_ratio" in df.columns else None,
+            sizes=(100, 400),
+            alpha=0.7,
+        )
     plt.xscale("log")
     plt.title("Total Parameters vs. Perplexity")
     plt.xlabel("Total Parameters")
@@ -1045,7 +1094,7 @@ def run_ablation_study(
         # Record results
         result = {
             "experiment_name": experiment_name,
-            "perplexity": eval_results.get("validation_perplexity", float("inf")),
+            "perplexity": eval_results.get("perplexity", float("inf")),
             "total_params": eval_results.get("total_params", 0),
             "active_params": eval_results.get("active_params", 0),
             "active_params_ratio": eval_results.get("active_params", 0)
