@@ -287,22 +287,6 @@ else
     echo "Skipping FlashAttention build as SKIP_FLASH_ATTN is set."
 fi
 
-# --- Transformer Engine ---
-export TE_REPO=${TE_REPO:-https://github.com/NVIDIA/TransformerEngine.git}
-export TE_REF=${TE_REF:-v1.9.0} # Use a recent tag or main
-export TE_BUILD_VERSION=${TE_BUILD_VERSION:-${TE_REF#v}+${CUDA_TAG}}
-# Transformer Engine uses NVTE_BUILD_VERSION
-export NVTE_BUILD_VERSION=${TE_BUILD_VERSION}
-if ! [[ -v SKIP_TE ]]; then
-    echo "Building Transformer Engine ${TE_REF}..."
-    reset_repo ${TE_REPO} ${TE_REF}
-    pushd TransformerEngine > /dev/null
-        echo "Starting Transformer Engine build..."
-        # Transformer Engine build might need specific env vars, check their docs
-        # It uses TORCH_CUDA_ARCH_LIST automatically
-        uv build --wheel --no-build-isolation -o ${WHEELS}
-        echo "Transformer Engine build finished."
-    popd > /dev/null
 # --- FlashAttention ---
 # Needs specific build flags
 export FLASH_ATTENTION_FORCE_BUILD=1
