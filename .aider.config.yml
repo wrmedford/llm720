@@ -1,0 +1,14 @@
+# Automatically run the PEER Triton CUDA kernel tests after each successful edit.                                                                                                                                     
+test-cmd: pytest tests/test_peer_triton.py                                                                                                                                                                            
+                                                                                                                                                                                                                      
+# Show diffs of the proposed changes before asking for confirmation.                                                                                                                                                  
+show-diffs: true                                                                                                                                                                                                      
+                                                                                                                                                                                                                      
+# Enable terminal bell notifications when LLM responses are ready.                                                                                                                                                    
+notifications: true                                                                                                                                                                                                   
+                                                                                                                                                                                                                      
+# Optional: Specify a model if you prefer something other than the default                                                                                                                                            
+# model: gpt-4o                                                                                                                                                                                                       
+                                                                                                                                                                                                                      
+# Optional: Uncomment to automatically commit after tests pass                                                                                                                                                        
+# auto-commits: true 
