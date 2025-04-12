@@ -303,6 +303,45 @@ if ! [[ -v SKIP_TE ]]; then
         uv build --wheel --no-build-isolation -o ${WHEELS}
         echo "Transformer Engine build finished."
     popd > /dev/null
+# --- FlashAttention ---
+# Needs specific build flags
+export FLASH_ATTENTION_FORCE_BUILD=1
+export FLASH_ATTN_REPO=${FLASH_ATTN_REPO:-https://github.com/Dao-AILab/flash-attention.git}
+export FLASH_ATTN_REF=${FLASH_ATTN_REF:-v2.7.4.post1} # Use a known tag or main
+export FLASH_ATTN_BUILD_VERSION=${FLASH_ATTN_BUILD_VERSION:-${FLASH_ATTN_REF#v}+${CUDA_TAG}}
+# FlashAttention doesn't use BUILD_VERSION directly, relies on setup.py logic
+if ! [[ -v SKIP_FLASH_ATTN ]]; then
+    echo "Building FlashAttention ${FLASH_ATTN_REF}..."
+    reset_repo ${FLASH_ATTN_REPO} ${FLASH_ATTN_REF}
+    pushd flash-attention > /dev/null
+        # Override version in setup.py if needed (check setup.py structure)
+        # Example: sed -i.bak "s/^version = .*/version = \"${FLASH_ATTN_BUILD_VERSION}\"/" setup.py
+        echo "Starting FlashAttention build..."
+        # FlashAttention build might need specific env vars like MAX_JOBS
+        # It uses TORCH_CUDA_ARCH_LIST automatically
+        uv build --wheel --no-build-isolation -o ${WHEELS}
+        echo "FlashAttention build finished."
+    popd > /dev/null
+else
+    echo "Skipping FlashAttention build as SKIP_FLASH_ATTN is set."
+fi
+
+# --- Transformer Engine ---
+export TE_REPO=${TE_REPO:-https://github.com/NVIDIA/TransformerEngine.git}
+export TE_REF=${TE_REF:-v1.9.0} # Use a recent tag or main
+export TE_BUILD_VERSION=${TE_BUILD_VERSION:-${TE_REF#v}+${CUDA_TAG}}
+# Transformer Engine uses NVTE_BUILD_VERSION
+export NVTE_BUILD_VERSION=${TE_BUILD_VERSION}
+if ! [[ -v SKIP_TE ]]; then
+    echo "Building Transformer Engine ${TE_REF}..."
+    reset_repo ${TE_REPO} ${TE_REF}
+    pushd TransformerEngine > /dev/null
+        echo "Starting Transformer Engine build..."
+        # Transformer Engine build might need specific env vars, check their docs
+        # It uses TORCH_CUDA_ARCH_LIST automatically
+        uv build --wheel --no-build-isolation -o ${WHEELS}
+        echo "Transformer Engine build finished."
+    popd > /dev/null
 else
     echo "Skipping Transformer Engine build as SKIP_TE is set."
 fi
