@@ -190,6 +190,8 @@ if ! [[ -v SKIP_TORCH ]]; then
         echo "Installing PyTorch build requirements..."
         uv pip install -r requirements.txt
         echo "Starting PyTorch build (version ${PYTORCH_BUILD_VERSION})..."
+        # Set CMake policy version minimum to fix protobuf configuration issue
+        export CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
         # Use setup.py build method as recommended by PyTorch docs for custom builds
         python setup.py build
         echo "Creating PyTorch wheel..."
