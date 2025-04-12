@@ -182,12 +182,7 @@ test_configs = [
 )
 def config_params(request):
     """Provides parameterized configurations."""
-    # Add fixed params needed by PEER but not varied in these tests
     full_config = {
-        "input_dim": 128,
-        "output_dim": 128,
-        "expert_hidden_size": 8,
-        "batch_norm_query": False,  # Disable BN for easier gradcheck
         **request.param,  # Merge with parameterized values
     }
     return full_config
@@ -217,7 +212,6 @@ def sample_inputs(config_params):
     num_dims = len(config_params["product_key_dim"])
     sub_query_dim = query_dim // num_dims
     for dim_size in config_params["product_key_dim"]:
-        # Detach keys before passing to reference/triton function if they come from a fixture
         keys = torch.randn(
             dim_size, sub_query_dim, device=device, dtype=dtype, requires_grad=True
         )
