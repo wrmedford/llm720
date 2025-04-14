@@ -301,18 +301,19 @@ class ExpertUsageTracker:
         Get a summary of expert usage patterns.
 
         Returns:
-            Dict containing usage statistics
+            Dict containing usage statistics, ensuring values are JSON serializable.
         """
+        # Ensure counts are standard Python ints
         summary = {
-            "total_tokens_processed": self.total_tokens_processed,
-            "hot_experts_count": len(self.hot_experts),
+            "total_tokens_processed": int(self.total_tokens_processed),
+            "hot_experts_count": int(len(self.hot_experts)),
             "hot_experts": [
-                (layer, expert) for layer, expert in sorted(self.hot_experts)
+                (int(layer), int(expert)) for layer, expert in sorted(self.hot_experts)
             ],
             "layer_stats": {},
         }
 
-        # Add layer statistics
+        # Add layer statistics, ensuring values are JSON serializable
         for layer_idx, history in self.layer_usage_history.items():
             if not history:
                 continue
@@ -320,10 +321,11 @@ class ExpertUsageTracker:
             # Most recent stats
             latest = history[-1]
 
-            summary["layer_stats"][layer_idx] = {
-                "experts_used": latest["experts_used"],
-                "usage_coverage": latest["usage_coverage"],
-                "avg_usage": latest["avg_usage"],
+            # Ensure layer_idx and stats are standard types
+            summary["layer_stats"][int(layer_idx)] = {
+                "experts_used": int(latest["experts_used"]),
+                "usage_coverage": float(latest["usage_coverage"]), # Floats are fine
+                "avg_usage": float(latest["avg_usage"]), # Floats are fine
             }
 
         return summary

@@ -18,6 +18,7 @@ import logging
 import os
 
 import torch
+import torch.compiler # Import the compiler module
 import torch.nn as nn
 import torch.optim as optim
 import yaml
@@ -30,12 +31,14 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (AutoTokenizer, DataCollatorForLanguageModeling,
                           get_scheduler)
-from float8_experimental import config as float8_config
-from float8_experimental.float8_linear import Float8Linear
-from float8_experimental.float8_linear_utils import (
-    swap_linear_with_float8_linear,
-    sync_float8_amax_and_scale_history
+# Use torchao for float8 support
+from torchao.float8 import ( # Updated import
+    convert_to_float8_training,
+    Float8LinearConfig,
+    # Optional: Import other config elements if needed later
+    # ScalingType, ScalingGranularity, CastConfig, Float8GemmConfig
 )
+# from torchao.utils import TORCH_VERSION_AT_LEAST_2_5 # Optional: Add version check if needed
 
 from llm.data.datasets import prepare_datasets, tokenize_function
 from llm.models.foundation import TransformerConfig, create_model_from_config
@@ -202,8 +205,25 @@ def save_checkpoint(model, optimizer, scheduler, global_step, epoch, filepath):
     else:
         model_state_dict = model.state_dict()
 
-    # Save model weights
-    save_file(model_state_dict, f"{filepath}.safetensors")
+    # Handle tied weights (embedding and lm_head) before saving with safetensors
+    # Check if weights are tied (common practice)
+    lm_head_key = "_orig_mod.lm_head.weight" # Key might change if torch.compile isn't used
+    wte_key = "_orig_mod.wte.weight"
+    # Adjust keys if not using torch.compile or if model structure differs
+    # Example: lm_head_key = "lm_head.weight", wte_key = "wte.weight"
+
+    if lm_head_key in model_state_dict and wte_key in model_state_dict:
+        if model_state_dict[lm_head_key].data_ptr() == model_state_dict[wte_key].data_ptr():
+            logger.info(f"Detected tied weights ({wte_key} and {lm_head_key}). Removing {lm_head_key} before saving.")
+            del model_state_dict[lm_head_key]
+
+    # Save model weights using safetensors
+    try:
+        save_file(model_state_dict, f"{filepath}.safetensors")
+    except RuntimeError as e:
+        logger.error(f"Failed to save model weights with safetensors: {e}")
+        logger.error("Consider checking for other tied weights or saving issues.")
+        raise # Re-raise the error after logging
 
     # Save additional training state
     training_state = {
@@ -265,19 +285,42 @@ def load_checkpoint(model, optimizer, scheduler, filepath):
     return global_step, epoch
 
 
+import os # Add os import
+
 class ModelEvaluator:
     """Evaluator for running evals on model checkpoints."""
 
     def __init__(self, registry_path, tokenizer, device):
+        self.registry = None
+        self.tokenizer = tokenizer
+        self.device = device
+        self.evals_available = False
+        self.openai_key_present = bool(os.environ.get("OPENAI_API_KEY"))
+
+        if not self.openai_key_present:
+            logger.warning(
+                "OPENAI_API_KEY not found in environment. OpenAI-based evaluations will be skipped."
+            )
+            return # Skip evals initialization
+
         try:
+            # Conditionally import only if key is present
             from evals.registry import Registry
 
             self.registry = Registry(registry_path)
-            self.tokenizer = tokenizer
-            self.device = device
+            self.evals_available = True
+            logger.info("Evals registry initialized successfully.")
+
         except ImportError:
-            logger.warning("Evals library not found. Evaluation will be limited.")
-            self.registry = None
+            logger.warning(
+                "Evals library not found or import failed, even though OPENAI_API_KEY is set. Evaluation will be skipped."
+            )
+        except Exception as e:
+            # Catch potential errors during Registry initialization
+            logger.warning(
+                f"Failed to initialize Evals registry: {e}. Evaluation will be skipped."
+            )
+
 
     def model_completion_fn(self, model, prompt, **kwargs):
         """Create a completion function for evals."""
@@ -311,15 +354,19 @@ class ModelEvaluator:
 
     def run_eval(self, model, eval_name):
         """Run a specific evaluation and return results."""
-        if not self.registry:
+        if not self.evals_available:
+            error_reason = "Evals library not available or failed to initialize."
+            if not self.openai_key_present:
+                error_reason = "Skipped due to missing OPENAI_API_KEY."
+
             return {
                 "eval_name": eval_name,
-                "error": "Evals library not available",
-                "metrics": {"error": 1.0},
+                "error": error_reason,
+                "metrics": {"skipped": 1.0}, # Use 'skipped' instead of 'error'
                 "samples": [],
             }
 
-        # Import necessary modules conditionally
+        # Import necessary modules conditionally (only if evals are available)
         import functools
 
         # Create completion function for this model
@@ -360,9 +407,17 @@ class ModelEvaluator:
 def get_train_setup(config: TrainerConfig, model: nn.Module):
     """Set up training components based on configuration."""
     # Get optimizer
+    # Ensure learning rate is a float
+    lr_value = config.train_config["learning_rate"]
+    try:
+        lr_float = float(lr_value)
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid learning rate value in config: {lr_value}. Must be a number. Error: {e}")
+        raise TypeError(f"Learning rate must be a float, but got {type(lr_value)}") from e
+
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=config.train_config["learning_rate"],
+        lr=lr_float, # Use the validated float value
         weight_decay=config.train_config["weight_decay"],
     )
 
@@ -402,9 +457,11 @@ def get_train_setup(config: TrainerConfig, model: nn.Module):
 def run_training(config: TrainerConfig):
     """Main training function."""
     # Set up accelerator
+    # Disable accelerate's mixed precision when using torchao's FP8 conversion,
+    # as torchao handles the precision internally.
     accelerator = Accelerator(
         gradient_accumulation_steps=config.train_config["gradient_accumulation_steps"],
-        mixed_precision="fp16" if config.train_config["fp16"] else "no",
+        mixed_precision="no", # Let torchao handle precision
         log_with="wandb" if config.wandb_config else None,
     )
 
@@ -440,16 +497,21 @@ def run_training(config: TrainerConfig):
     logger.info("Initializing model...")
     tf_config = TransformerConfig(**config.model_config)
     model = create_model_from_config(tf_config)
-    
-    # Configure float8_experimental
-    logger.info("Configuring float8_experimental...")
-    float8_config.enable_amax_init = False
-    float8_config.amax_history_len = 16
-    
-    # Swap nn.Linear layers with Float8Linear
-    logger.info("Swapping nn.Linear layers with Float8Linear...")
-    swap_linear_with_float8_linear(model, Float8Linear)
-    logger.info("Model layers swapped for FP8.")
+
+    # Convert model to use Float8 for training using torchao
+    # Ensure model is on the correct device and dtype (e.g., bf16) before conversion
+    # Note: The conversion should happen *before* accelerator.prepare or torch.compile
+    # Determine target dtype (bf16 preferred for H100+)
+    fp8_dtype = torch.bfloat16 if config.train_config.get("bf16", torch.cuda.is_bf16_supported()) else torch.float16
+    model = model.to(accelerator.device).to(fp8_dtype) # Move and cast before conversion
+
+    logger.info(f"Converting model to use Float8 with dtype {fp8_dtype}...")
+    # Re-enable padding to handle dimensions not divisible by 16 (like vocab size)
+    fp8_config = Float8LinearConfig(pad_inner_dim=True)
+    logger.info(f"Using Float8LinearConfig with padding: {fp8_config}")
+    convert_to_float8_training(model, config=fp8_config) # Pass the config
+    logger.info("Model converted for Float8 training with padding.")
+
 
     # Set up expert usage tracking if enabled
     expert_tracker = None
@@ -500,10 +562,18 @@ def run_training(config: TrainerConfig):
         mlm=False,
     )
 
+    # Determine appropriate number of workers
+    # Use half the available CPUs per process as a starting point, minimum 1
+    num_cpus = os.cpu_count() or 1
+    workers_per_process = max(1, num_cpus // accelerator.num_processes // 2)
+    logger.info(f"Using {workers_per_process} DataLoader workers per process.")
+
     train_dataloader = DataLoader(
         tokenized_dataset,
         batch_size=config.train_config["per_device_train_batch_size"],
         collate_fn=data_collator,
+        num_workers=workers_per_process,
+        pin_memory=True, # Pin memory for faster CPU to GPU transfers
     )
 
     # Set up optimizer and scheduler
@@ -563,6 +633,16 @@ def run_training(config: TrainerConfig):
             logger.error(
                 f"Failed to load checkpoint from {checkpoint_path}: {e}. Starting from scratch."
             )
+    else:
+        # If not resuming, ensure MLA weights are prepared after model is on device
+        logger.info("Preparing MLA decode weights for initial model...")
+        unwrapped_model = accelerator.unwrap_model(model)
+        if hasattr(unwrapped_model, "blocks"):
+            for block in unwrapped_model.blocks:
+                if hasattr(block, "attention") and hasattr(
+                    block.attention, "post_weight_load"
+                ):
+                    block.attention.post_weight_load()
 
     # Training loop
     logger.info("Starting training...")
@@ -582,34 +662,38 @@ def run_training(config: TrainerConfig):
             if global_step >= max_steps:
                 break
 
+            # Mark the beginning of a CUDA graph step before model invocation
+            # This helps manage memory for compiled functions with dynamic parts.
+            torch.compiler.cudagraph_mark_step_begin()
+
             # Prepare inputs
             batch = prepare_model_inputs(batch, accelerator.device)
 
-            # Forward pass with autocast for non-FP8 operations
-            autocast_dtype = torch.bfloat16 if config.train_config.get("bf16", torch.cuda.is_bf16_supported()) else torch.float16
-            with torch.autocast(device_type=accelerator.device.type, dtype=autocast_dtype):
-                with accelerator.accumulate(model):
-                    outputs = model(**batch)
-                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            # Forward pass - FP8 conversion handles internal types
+            # No explicit autocast needed here if model and inputs are already bf16/fp16
+            with accelerator.accumulate(model):
+                outputs = model(**batch)
+                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
-            # Note: Backward pass MUST be outside the fp8_autocast context
-            # Accelerator handles gradient accumulation context correctly with backward outside
-            if accelerator.is_main_process:  # Only log loss once per accumulation cycle
-                accelerator.log({"train/loss_unscaled": loss.item()}, step=global_step)
+            # Log loss
+            if accelerator.is_main_process: # Log loss once per accumulation cycle
+                # Detach loss before calling .item() to avoid warning
+                accelerator.log({"train/loss": loss.detach().item()}, step=global_step)
 
-            # Backward pass (outside fp8_autocast)
+            # Backward pass
             accelerator.backward(loss)
 
-            # Clip gradients (after backward)
-            if accelerator.sync_gradients:  # Only clip when gradients are synchronized
+            # Clip gradients and Optimizer step (handled by accelerator)
+            if accelerator.sync_gradients: # Operations after gradient sync
                 if config.train_config["max_grad_norm"] > 0:
                     accelerator.clip_grad_norm_(
                         model.parameters(), config.train_config["max_grad_norm"]
                     )
-                # Sync FP8 scaling factors across processes and update history
-                sync_float8_amax_and_scale_history(model)
+                # Note: FP8 scale synchronization is typically handled by FSDP or similar
+                # distributed strategies when using torchao's float8 with distributed training.
+                # No explicit sync call needed here for single-node or basic DDP.
 
-            # Optimizer step
+            # Optimizer step (happens when gradients are synced or at end of accumulation)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -637,7 +721,8 @@ def run_training(config: TrainerConfig):
                     approx_epoch = global_step / config.train_config["steps_per_epoch"]
 
                 metrics = {
-                    "train/loss": loss.item(),
+                    # Detach loss before calling .item()
+                    "train/loss": loss.detach().item(),
                     "train/learning_rate": lr,
                     "train/global_step": global_step,
                 }

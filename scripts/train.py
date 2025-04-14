@@ -13,6 +13,11 @@ import logging
 import os
 import sys
 
+# Add parent directory to path to ensure imports work correctly
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# These imports are intentionally placed here after modifying the path
+# flake8: noqa: E402
 from llm.training.train import TrainerConfig, run_training
 
 # Configure logger

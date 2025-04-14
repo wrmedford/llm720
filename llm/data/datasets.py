@@ -74,9 +74,10 @@ def prepare_datasets(config: Dict) -> IterableDataset:
                 )
             else:
                 # HuggingFace dataset
-                logger.info(f"Loading HuggingFace dataset {dataset_path}")
+                logger.info(f"Loading HuggingFace dataset {dataset_path} (subset: {dataset_info.get('subset')})")
                 dataset = load_dataset(
                     dataset_path,
+                    name=dataset_info.get("subset"), # Pass the subset as the 'name' argument
                     split=dataset_info.get("split", "train"),
                     streaming=dataset_info.get("streaming", True),
                 )
@@ -130,31 +131,18 @@ def prepare_datasets(config: Dict) -> IterableDataset:
                 # Continue with the specified text_field and hope for the best
 
             def map_fn(example):
-                # Check if text field exists
-                if text_field in example:
-                    text_content = example[text_field]
-                    # Verify the content is a string and not empty
-                    if isinstance(text_content, str) and text_content.strip():
-                        return {"text": text_content}
-                    else:
-                        logger.warning(f"Text field '{text_field}' exists but contains non-string or empty content in dataset {dataset_info['name']}.")
-                
-                # If we get here, either the field doesn't exist or has invalid content
-                # Try to find any suitable text field as a fallback
-                potential_fields = [
-                    (k, v) for k, v in example.items() 
-                    if isinstance(v, str) and len(v.strip()) > 50
-                ]
-                
-                if potential_fields:
-                    # Sort by length to get the field with the most content
-                    potential_fields.sort(key=lambda x: len(x[1]), reverse=True)
-                    chosen_field, content = potential_fields[0]
-                    logger.warning(
-                        f"Using fallback field '{chosen_field}' for dataset {dataset_info['name']}. "
-                        f"Please update your configuration."
-                    )
-                    return {"text": content}
+                # Prioritize the specified text_field
+                if text_field in example and isinstance(example[text_field], str):
+                    return {"text": example[text_field]}
+
+                # Fallback logic (simplified) - find the first non-empty string field
+                for k, v in example.items():
+                    if isinstance(v, str) and v.strip():
+                        if k != text_field: # Log only if using a fallback field
+                             logger.warning(
+                                 f"Specified text field '{text_field}' not found or invalid. Using fallback field '{k}' for dataset {dataset_info['name']}."
+                             )
+                        return {"text": v}
                 else:
                     # If no suitable field found, log error and return empty text
                     # This will create essentially empty examples that should be filtered out
@@ -162,18 +150,21 @@ def prepare_datasets(config: Dict) -> IterableDataset:
                         f"No suitable text content found in example from dataset {dataset_info['name']}. "
                         f"Fields: {list(example.keys())}"
                     )
+                    # If no suitable string field found, return empty string for filtering
                     return {"text": ""}
 
-            # Map to standardize text field and then filter out empty examples
+            # Map to standardize text field
             dataset = dataset.map(map_fn)
-            
-            # Filter out empty examples
+
+            # Filter out examples with empty or whitespace-only text
             def filter_empty(example):
-                return example["text"] != "" and len(example["text"].strip()) > 0
-            
+                # Check if 'text' exists and is a string before stripping
+                text_content = example.get("text")
+                return isinstance(text_content, str) and len(text_content.strip()) > 0
+
             filtered_dataset = dataset.filter(filter_empty)
-            
-            # Log how many examples were filtered out (if possible)
+
+            # Log dataset readiness (logging counts might be difficult/slow with streaming)
             try:
                 # This might not work for all streaming datasets
                 logger.info(f"Dataset {dataset_info['name']} ready for training")

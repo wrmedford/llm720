@@ -97,9 +97,9 @@ We recommend using `uv` for faster environment management.
     - **`flash-attn`:** Installation on ARM architectures might fail as pre-built wheels are often unavailable. You may need to:
         - **Build from source:** Follow the official instructions for `flash-attn`, which may require specific compilers (like `gcc`, `g++`) and the CUDA toolkit installed on your system.
         - **Comment out:** If you don't strictly need FlashAttention for MLA initially, you can temporarily comment out `flash-attn` in `setup.py` and reinstall using the command above. The code includes PyTorch fallbacks.
-    - **`float8_experimental`:** Requires a recent PyTorch version (nightly or >= 2.2) with FP8 support. It's installed directly from GitHub.
+    - **`torchao`:** Provides FP8 support and other optimizations. Requires a recent PyTorch version (>=2.5 recommended).
 
-    If installation fails, check the specific error messages and consult the documentation for `flash-attn` and `float8_experimental`.
+    If installation fails, check the specific error messages and consult the documentation for `flash-attn` and `torchao`.
 
 ## Building Dependencies from Source (Advanced)
 
@@ -137,7 +137,7 @@ This project includes a script to build these core dependencies from source tail
     *   (On ARM) Build the ARM Compute Library.
     *   Place the compiled wheels into the `wheels/` directory.
     *   Install the built wheels using `uv`.
-    *   Install `float8_experimental` from GitHub.
+    *   Install `torchao` (usually included in the final `uv pip install` step).
     *   Install the `llm` project itself in editable mode.
 
 3.  **Activate Environment:**
@@ -157,9 +157,9 @@ After the script completes successfully, your environment will have the core dep
     ```bash
     # Activate environment: source .venv/bin/activate
     # Install PyTorch (example for CUDA 12.1):
-    # Note: For FP8 support, use a recent nightly build or PyTorch >= 2.2
-    uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
-    # Install base package (handle flash-attn/triton build errors if they occur):
+    # Note: For FP8 support via torchao, use PyTorch >= 2.5
+    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    # Install base package (includes torchao, flash-attn):
     uv pip install --no-build-isolation -e .
     ```
 2.  Prepare your configuration file:

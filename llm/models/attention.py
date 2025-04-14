@@ -226,7 +226,7 @@ class MultiHeadedLatentAttention(nn.Module):
         # Register as buffers to ensure they move with the model (.to(device))
         self.register_buffer('W_UV', None, persistent=False)
         self.register_buffer('W_UK_T', None, persistent=False)
-        self._prepare_kv_weights()  # Attempt initial preparation
+        # self._prepare_kv_weights() # Removed initial call - will be called later
 
     def _prepare_kv_weights(self):
         """
@@ -531,9 +531,11 @@ class MultiHeadedLatentAttention(nn.Module):
             v_mqa_sdpa = v_mqa_sdpa.transpose(1, 2) # [bsz, num_heads, kv_seq_len, v_dim]
 
             # SDPA calculation
+            # Ensure Q, K, V have the same dtype
+            target_dtype = v_mqa_sdpa.dtype
             attn_output_mqa = scaled_dot_product_attention(
-                q_mqa_sdpa,
-                k_mqa_sdpa,
+                q_mqa_sdpa.to(target_dtype),
+                k_mqa_sdpa.to(target_dtype),
                 v_mqa_sdpa,
                 attn_mask=None, # Use is_causal for decode
                 dropout_p=0.0,
@@ -653,9 +655,11 @@ class MultiHeadedLatentAttention(nn.Module):
                          sdpa_mask = sdpa_mask < 0
                 # If mask is None, is_causal flag handles causal masking
 
+                # Ensure Q, K, V have the same dtype
+                target_dtype = value_states_sdpa.dtype
                 attn_output_sdpa = scaled_dot_product_attention(
-                    query_states_sdpa,
-                    key_states_sdpa,
+                    query_states_sdpa.to(target_dtype),
+                    key_states_sdpa.to(target_dtype),
                     value_states_sdpa,
                     attn_mask=sdpa_mask,
                     dropout_p=self.dropout_p if self.training else 0.0,

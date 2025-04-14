@@ -4,6 +4,7 @@ model_config:
   num_hidden_layers: 12
   num_attention_heads: 12
   intermediate_size: 3072
+  vocab_size: 50272 # Padded vocab size (divisible by 16) for FP8 compatibility
 
   # PEER configuration
   use_peer: true

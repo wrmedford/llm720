@@ -18,14 +18,14 @@ setup(
         "wandb>=0.13.0",
         "accelerate>=0.10.0",
         "safetensors>=0.2.0",
-        "PyYAML>=6.0",
+        "PyYAML>=6.0", # Provides the 'yaml' module
         "tqdm>=4.62.0",
         "matplotlib>=3.5.0",
         "seaborn>=0.12.0",
         "pandas>=1.3.0",
         "tabulate>=0.8.0",
         "flash-attn>=2.0.0; platform_system=='Linux'", # flash-attn is often Linux-only
-        "float8_experimental @ git+https://github.com/pytorch-labs/float8_experimental.git",  # PyTorch native FP8 support
+        "torchao>=0.10.0", # Use torchao for FP8 and other optimizations
         "pynvml>=11.0.0",  # For GPU monitoring
     ],
     extras_require={

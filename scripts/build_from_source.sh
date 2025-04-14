@@ -267,10 +267,7 @@ else
     echo "Skipping FlashAttention build as SKIP_FLASH_ATTN is set."
 fi
 
-# --- Install float8_experimental ---
-echo "Installing float8_experimental from GitHub..."
-uv pip install git+https://github.com/pytorch-labs/float8_experimental.git
-echo "float8_experimental installation complete."
+# Note: torchao will be installed later with other wheels or the main project
 
 
 popd > /dev/null # Exit src directory

@@ -28,35 +28,42 @@ class PositionalEmbedding(nn.Module):
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
+        # Removed cache buffers (cos_cached, sin_cached)
 
-        # Initialize freq_cis with shape (seq_len, d)
-        self.register_buffer("cos_cached", None, persistent=False)
-        self.register_buffer("sin_cached", None, persistent=False)
+    def forward(self, position_ids: torch.LongTensor, device: Optional[torch.device] = None): # Accept position_ids
+        # Determine the maximum position ID needed using tensor operations
+        # Add 1 because position IDs are 0-indexed
+        req_len_tensor = position_ids.max() + 1
 
-    def forward(self, seq_len=None):
-        if seq_len is None:
-            seq_len = self.max_seq_len
+        # Ensure req_len doesn't exceed max_seq_len (use tensor comparison)
+        if torch.any(req_len_tensor > self.max_seq_len):
+             # Find the actual max value causing the error for a better message
+             max_pos_val = position_ids.max().item() # .item() is ok here for error message
+             raise ValueError(f"Requested sequence length {max_pos_val + 1} based on position_ids exceeds max_seq_len {self.max_seq_len}")
 
-        if self.cos_cached is not None and seq_len <= self.cos_cached.shape[0]:
-            return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+        # Determine the device
+        if device is None:
+            device = position_ids.device # Infer from position_ids
 
-        # Generate position indices
-        position = torch.arange(seq_len).float()
+        # --- Always compute RoPE embeddings ---
+        # Use the tensor req_len_tensor for arange
+        # Note: torch.arange can accept a 0-dim tensor for the end argument.
+        # Pass req_len_tensor directly to avoid the .item() graph break.
+        position = torch.arange(req_len_tensor, device=device).float() # Use tensor directly
 
-        # Create freqs
-        freqs = self.base ** (torch.arange(0, self.dim, 2).float() / self.dim)
+        # Create freqs on the target device
+        freqs_base = torch.arange(0, self.dim, 2, device=device).float() / self.dim
+        freqs = self.base ** freqs_base
 
         # Compute the complex embeddings: e^(i * position * freq)
-        freqs = torch.outer(position, 1.0 / freqs)  # [seq_len, dim//2]
+        # freqs = torch.outer(position, 1.0 / freqs) # [seq_len, dim//2] # outer doesn't support device arg well before 2.0
+        freqs = position[:, None] * (1.0 / freqs[None, :]) # Manual outer product
 
-        # Convert to sin and cos
-        cos = torch.cos(freqs)  # [seq_len, dim//2]
-        sin = torch.sin(freqs)  # [seq_len, dim//2]
+        # Convert to sin and cos on the target device
+        cos = torch.cos(freqs)  # [req_len, dim//2]
+        sin = torch.sin(freqs)  # [req_len, dim//2]
 
-        # Cache the embeddings
-        self.register_buffer("cos_cached", cos, persistent=False)
-        self.register_buffer("sin_cached", sin, persistent=False)
-
+        # Return the computed tensors directly (no caching, no cloning needed)
         return cos, sin
 
 
@@ -79,7 +86,7 @@ class TransformerConfig:
         peer_start_layer=2, # Layer index from which PEER layers start
         peer_config=None,
         mla_config=None, # MLA is always used
-        vocab_size=50257,  # GPT-2 vocab size
+        vocab_size=50272,  # Padded vocab size (divisible by 16)
     ):
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -124,10 +131,19 @@ class TransformerBlock(nn.Module):
         # MLP/PEER layer - always assign to self.feed_forward
         # Use PEER from peer_start_layer onwards, otherwise use standard MLP
         if config.use_peer and layer_idx >= config.peer_start_layer:
+            # Filter peer_config to only include arguments accepted by PEER.__init__
+            peer_init_args = {
+                k: v for k, v in config.peer_config.items()
+                if k in PEER.__init__.__code__.co_varnames # Inspect PEER init args
+            }
+            # Remove tracker-specific args if they somehow got included
+            for tracker_arg in ["log_expert_usage", "log_freq", "usage_threshold"]:
+                peer_init_args.pop(tracker_arg, None)
+
             self.feed_forward = PEER(
                 input_dim=config.hidden_size,
                 output_dim=config.hidden_size,
-                **config.peer_config,
+                **peer_init_args, # Pass only the filtered arguments
             )
         else:
             # Standard MLP wrapped in nn.Sequential
@@ -311,13 +327,9 @@ class FoundationModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
 
-        # Generate positional embeddings (cos, sin caches)
-        # Pass the required sequence length which might include past length
-        cos, sin = self.wpe(seq_len=seq_length + past_key_values_length)
-        # Slice cos/sin based on the maximum position ID needed for this pass
-        max_pos = position_ids.max()
-        cos = cos[: max_pos + 1]
-        sin = sin[: max_pos + 1]
+        # Generate positional embeddings (cos, sin) based on position_ids
+        # Pass position_ids directly to wpe. It returns the correctly sized, cloned tensors.
+        cos, sin = self.wpe(position_ids=position_ids, device=device)
 
         # Prepare causal attention mask
         # Standard Hugging Face causal mask preparation

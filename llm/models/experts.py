@@ -72,9 +72,10 @@ class PEER(nn.Module):
         self.query_proj = nn.Linear(input_dim, num_heads * query_dim)
 
         if batch_norm_query:
-            # Keep standard BatchNorm for now, TE doesn't have a direct
-            # replacement. Ensure it runs in FP32 (handled below in forward)
-            self.query_batch_norm = nn.BatchNorm1d(query_dim)
+            # Use LayerNorm instead of BatchNorm for better torch.compile compatibility
+            self.query_layer_norm = nn.LayerNorm(query_dim)
+        else:
+            self.query_layer_norm = None # Explicitly set to None if not used
 
         # Create sub-key embeddings for each dimension
         self.sub_keys = nn.ParameterList()
@@ -274,17 +275,16 @@ class PEER(nn.Module):
         queries = self.query_proj(hidden_states)
         queries = queries.view(batch_size, seq_len, self.num_heads, self.query_dim)
 
-        # Apply batch norm to queries if enabled (ensure FP32 execution)
-        if self.batch_norm_query:
-            # Reshape for batch norm
-            orig_shape = queries.shape
-            input_dtype = queries.dtype
-            queries_flat = queries.view(-1, self.query_dim)
-            # Cast input to BatchNorm1d to FP32
-            queries_fp32 = queries_flat.to(torch.float32)
-            queries_normed_fp32 = self.query_batch_norm(queries_fp32)
-            # Cast output back to original dtype
-            queries = queries_normed_fp32.to(input_dtype).view(*orig_shape)
+        # Apply layer norm to queries if enabled
+        if self.batch_norm_query and self.query_layer_norm is not None:
+            # LayerNorm operates on the last dimension(s), compatible with (B, S, H, C)
+            queries = self.query_layer_norm(queries)
+        elif self.batch_norm_query and self.query_layer_norm is None:
+            # This case should not happen if __init__ logic is correct, but log a warning
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("batch_norm_query is True but query_layer_norm was not initialized.")
+
 
         # Use the optimized PyTorch implementation directly
         indices, scores = self._get_expert_indices_pytorch(
