@@ -1,6 +1,3 @@
-# Automatically run the PEER Triton CUDA kernel tests after each successful edit.                                                                                                                                     
-test-cmd: pytest tests/test_peer_triton.py                                                                                                                                                                            
-                                                                                                                                                                                                                      
 # Show diffs of the proposed changes before asking for confirmation.                                                                                                                                                  
 show-diffs: true                                                                                                                                                                                                      
                                                                                                                                                                                                                       

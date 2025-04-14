@@ -25,10 +25,8 @@ setup(
         "pandas>=1.3.0",
         "tabulate>=0.8.0",
         "flash-attn>=2.0.0; platform_system=='Linux'", # flash-attn is often Linux-only
-        "transformer-engine>=1.0",  # Add Transformer Engine dependency
-        # Add Triton dependency - conditional on platform.
-        # NOTE: ARM support might require building from source. Python version constraint removed.
-        "triton>=2.1.0; platform_system=='Linux'",
+        "float8_experimental @ git+https://github.com/pytorch-labs/float8_experimental.git",  # PyTorch native FP8 support
+        "pynvml>=11.0.0",  # For GPU monitoring
     ],
     extras_require={
         "dev": [

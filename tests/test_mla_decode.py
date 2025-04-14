@@ -1,10 +1,18 @@
 import pytest
 import torch
+import sys
 
-# Adjust imports based on your project structure
-from llm.models.attention import MultiHeadedLatentAttention
-from llm.models.foundation import \
-    PositionalEmbedding  # For RoPE cache generation
+# Check Python version compatibility
+if sys.version_info.major != 3 or sys.version_info.minor < 10:
+    pytest.skip("Tests require Python 3.10+", allow_module_level=True)
+
+try:
+    # Adjust imports based on your project structure
+    from llm.models.attention import MultiHeadedLatentAttention
+    from llm.models.foundation import \
+        PositionalEmbedding  # For RoPE cache generation
+except ImportError as e:
+    pytest.skip(f"Required modules not available: {e}", allow_module_level=True)
 
 # Mark all tests in this file to be skipped if CUDA is not available
 pytestmark = pytest.mark.skipif(

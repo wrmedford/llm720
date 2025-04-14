@@ -15,7 +15,6 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te  # Import Transformer Engine
 
 from llm.models.attention import MultiHeadedLatentAttention
 from llm.models.experts import PEER
@@ -77,9 +76,9 @@ class TransformerConfig:
         initializer_range=0.02,
         layer_norm_eps=1e-5,
         use_peer=True,
+        peer_start_layer=2, # Layer index from which PEER layers start
         peer_config=None,
-        # use_mla=True, # MLA is now always used
-        mla_config=None,
+        mla_config=None, # MLA is always used
         vocab_size=50257,  # GPT-2 vocab size
     ):
         self.hidden_size = hidden_size
@@ -93,9 +92,9 @@ class TransformerConfig:
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
         self.use_peer = use_peer
+        self.peer_start_layer = peer_start_layer
         self.peer_config = peer_config or {}
-        # self.use_mla = use_mla # MLA is now always used
-        self.mla_config = mla_config or {}
+        self.mla_config = mla_config or {} # MLA is always used
         self.vocab_size = vocab_size
 
 
@@ -107,9 +106,9 @@ class TransformerBlock(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        # Layer norms (replace with TE LayerNorm)
-        self.ln_1 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.ln_2 = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # Layer norms
+        self.ln_1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.ln_2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         # Attention layer - always use MLA
         # Ensure mla_config is passed correctly
@@ -122,25 +121,23 @@ class TransformerBlock(nn.Module):
             **mla_params,
         )
 
-        # MLP/PEER layer
-        if config.use_peer and layer_idx % 2 == 1:  # Apply PEER to alternate layers
+        # MLP/PEER layer - always assign to self.feed_forward
+        # Use PEER from peer_start_layer onwards, otherwise use standard MLP
+        if config.use_peer and layer_idx >= config.peer_start_layer:
             self.feed_forward = PEER(
                 input_dim=config.hidden_size,
                 output_dim=config.hidden_size,
                 **config.peer_config,
             )
         else:
-            # Standard MLP (replace with TE Linear)
-            # Note: TE Linear doesn't include activation/dropout, apply separately
-            self.ffn_linear1 = te.Linear(config.hidden_size, config.intermediate_size)
-            self.ffn_activation = nn.GELU()  # Keep standard activation
-            self.ffn_dropout1 = nn.Dropout(config.dropout)  # Keep standard dropout
-            self.ffn_linear2 = te.Linear(config.intermediate_size, config.hidden_size)
-            self.ffn_dropout2 = nn.Dropout(
-                config.dropout
-            )  # Dropout after second linear
-
-        # self.dropout = nn.Dropout(config.dropout) # Now handled within MLP/Attention
+            # Standard MLP wrapped in nn.Sequential
+            self.feed_forward = nn.Sequential(
+                nn.Linear(config.hidden_size, config.intermediate_size),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.intermediate_size, config.hidden_size),
+                nn.Dropout(config.dropout),
+            )
 
     def forward(
         self,
@@ -185,19 +182,11 @@ class TransformerBlock(nn.Module):
         # TE LayerNorm handles precision
         hidden_states_ln = self.ln_2(hidden_states)
 
-        # Apply MLP/PEER
-        if isinstance(self.feed_forward, PEER):
-            hidden_states = self.feed_forward(hidden_states_ln)
-        else:
-            # Apply standard MLP using TE layers
-            hidden_states = self.ffn_linear1(hidden_states_ln)
-            hidden_states = self.ffn_activation(hidden_states)
-            hidden_states = self.ffn_dropout1(hidden_states)
-            hidden_states = self.ffn_linear2(hidden_states)
-            hidden_states = self.ffn_dropout2(hidden_states)
+        # Apply MLP/PEER (now always assigned to self.feed_forward)
+        ff_output = self.feed_forward(hidden_states_ln)
 
         # Apply residual
-        hidden_states = residual + hidden_states
+        hidden_states = residual + ff_output
 
         # Return signature: (hidden_states, present_key_value, optional_attn_weights)
         outputs = (hidden_states, present_key_value)
@@ -218,11 +207,8 @@ class FoundationModel(nn.Module):
 
         # Positional embeddings for rotary attention
         # Use qk_rope_head_dim if MLA is enabled, otherwise calculate based on hidden_size/num_heads
-        rope_dim = (
-            config.hidden_size // config.num_attention_heads
-        )  # Default for standard attention
-        if config.use_mla and config.mla_config:
-            rope_dim = config.mla_config.get("qk_rope_head_dim", 64)
+        # MLA is always used, determine RoPE dimension from mla_config
+        rope_dim = config.mla_config.get("qk_rope_head_dim", 64) # Default to 64 if not specified
 
         self.wpe = PositionalEmbedding(
             dim=rope_dim,
@@ -240,11 +226,11 @@ class FoundationModel(nn.Module):
             ]
         )
 
-        # Final layer norm (replace with TE LayerNorm)
-        self.ln_f = te.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # Final layer norm
+        self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        # Head for language modeling (replace with TE Linear)
-        self.lm_head = te.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Head for language modeling
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights
         self.apply(self._init_weights)

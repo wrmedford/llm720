@@ -20,7 +20,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import transformer_engine.pytorch as te  # Import Transformer Engine
 import yaml
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -29,10 +28,14 @@ from safetensors.torch import load_file, save_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformer_engine.common.recipe import (  # Import FP8 recipe components
-    DelayedScaling, Format)
 from transformers import (AutoTokenizer, DataCollatorForLanguageModeling,
                           get_scheduler)
+from float8_experimental import config as float8_config
+from float8_experimental.float8_linear import Float8Linear
+from float8_experimental.float8_linear_utils import (
+    swap_linear_with_float8_linear,
+    sync_float8_amax_and_scale_history
+)
 
 from llm.data.datasets import prepare_datasets, tokenize_function
 from llm.models.foundation import TransformerConfig, create_model_from_config
@@ -58,6 +61,7 @@ class TrainerConfig:
             "intermediate_size": 3072,
             # PEER configuration
             "use_peer": True,
+            "peer_start_layer": 2, # Start PEER layers from layer index 2
             "peer_config": {
                 "num_experts": 1024,  # Default 1024 experts (32x32)
                 "num_experts_per_tok": 16,
@@ -436,6 +440,16 @@ def run_training(config: TrainerConfig):
     logger.info("Initializing model...")
     tf_config = TransformerConfig(**config.model_config)
     model = create_model_from_config(tf_config)
+    
+    # Configure float8_experimental
+    logger.info("Configuring float8_experimental...")
+    float8_config.enable_amax_init = False
+    float8_config.amax_history_len = 16
+    
+    # Swap nn.Linear layers with Float8Linear
+    logger.info("Swapping nn.Linear layers with Float8Linear...")
+    swap_linear_with_float8_linear(model, Float8Linear)
+    logger.info("Model layers swapped for FP8.")
 
     # Set up expert usage tracking if enabled
     expert_tracker = None
@@ -499,6 +513,11 @@ def run_training(config: TrainerConfig):
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, scheduler
     )
+    
+    # Compile model for better performance
+    logger.info("Compiling model with torch.compile...")
+    model = torch.compile(model, mode="reduce-overhead")
+    logger.info("Model compiled.")
 
     # Set up evaluator
     evaluator = ModelEvaluator(
@@ -566,14 +585,9 @@ def run_training(config: TrainerConfig):
             # Prepare inputs
             batch = prepare_model_inputs(batch, accelerator.device)
 
-            # Forward pass within fp8_autocast context
-            # Define FP8 recipe (adjust parameters as needed)
-            fp8_format = Format.HYBRID  # E4M3 for forward, E5M2 for backward
-            fp8_recipe = DelayedScaling(
-                fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max"
-            )
-
-            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            # Forward pass with autocast for non-FP8 operations
+            autocast_dtype = torch.bfloat16 if config.train_config.get("bf16", torch.cuda.is_bf16_supported()) else torch.float16
+            with torch.autocast(device_type=accelerator.device.type, dtype=autocast_dtype):
                 with accelerator.accumulate(model):
                     outputs = model(**batch)
                     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
@@ -586,14 +600,16 @@ def run_training(config: TrainerConfig):
             # Backward pass (outside fp8_autocast)
             accelerator.backward(loss)
 
-            # Clip gradients (outside fp8_autocast, after backward)
+            # Clip gradients (after backward)
             if accelerator.sync_gradients:  # Only clip when gradients are synchronized
                 if config.train_config["max_grad_norm"] > 0:
                     accelerator.clip_grad_norm_(
                         model.parameters(), config.train_config["max_grad_norm"]
                     )
+                # Sync FP8 scaling factors across processes and update history
+                sync_float8_amax_and_scale_history(model)
 
-            # Optimizer step (outside fp8_autocast, after backward and clipping)
+            # Optimizer step
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()

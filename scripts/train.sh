@@ -100,8 +100,14 @@ echo "Starting training with $NUM_NODES nodes, $GPUS_PER_NODE GPUs per node, $WO
 echo "Using configuration file: $CONFIG_FILE"
 echo "Logs will be saved to: $LOG_DIR"
 
+# Prepare extra arguments if using nightly builds
+EXTRA_ARGS=""
+if [[ -v USE_NIGHTLY ]]; then
+  EXTRA_ARGS="--extra-index-url $PYTORCH_INDEX_URL"
+fi
+
 # Use torchrun for distributed training
-torchrun \
+PYTHONPATH="$PYTHONPATH:$(pwd)" torchrun \
   --nnodes=$NUM_NODES \
   --nproc_per_node=$GPUS_PER_NODE \
   --rdzv_id=job_$(date +%Y%m%d_%H%M%S) \
@@ -110,6 +116,7 @@ torchrun \
   --node_rank=$NODE_RANK \
   scripts/train.py \
   --config "$CONFIG_FILE" \
+  $EXTRA_ARGS \
   2>&1 | tee "$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log" || handle_failure $?
 
 echo "Training completed successfully!"

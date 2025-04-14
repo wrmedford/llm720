@@ -17,7 +17,9 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import transformer_engine.pytorch as te  # Import Transformer Engine
+from torch.nn.functional import scaled_dot_product_attention
+
+import sys
 
 try:
     from flash_attn import flash_attn_varlen_func
@@ -28,9 +30,23 @@ try:
 except ImportError:
     print("FlashAttention is not installed. Falling back to standard attention.")
     # Use torch.nn.functional.scaled_dot_product_attention as fallback
-    from torch.nn.functional import scaled_dot_product_attention
-
     HAS_FLASH_ATTN = False
+
+
+# Copied from transformers.models.llama.modeling_llama.repeat_kv
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim)
+    to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
 # Assuming RoPE implementation is available, e.g., from foundation
@@ -94,10 +110,18 @@ def apply_rotary_pos_emb(
     rotated_t = torch.cat((-t_rot_half2, t_rot_half1), dim=-1)
 
     # Apply RoPE: (x * cos) + (rotate_half(x) * sin)
+    cos = cos.repeat(1, 1, 2)
+    sin = sin.repeat(1, 1, 2)
     t_rope = (t_rot * cos) + (rotated_t * sin)
 
     # Combine the rotated part with the non-rotated part
-    return torch.cat((t_rope, t[..., rotary_dim:]), dim=-1)
+    final_t = torch.cat((t_rope, t[..., rotary_dim:]), dim=-1)
+
+    # Reshape back to original shape if input was 4D
+    if len(original_shape) == 4:
+        final_t = final_t.reshape(*original_shape) # Use tuple unpacking
+
+    return final_t
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -152,48 +176,56 @@ class MultiHeadedLatentAttention(nn.Module):
         # Store dimensions needed for MLA logic
         # MLA uses num_kv_heads = 1 conceptually for latent cache
         self.num_kv_heads = 1
+        self.num_key_value_groups = self.num_heads // self.num_kv_heads # Groups for GQA/MQA repeat_kv
+
+        # Scales for attention (can be calculated based on different dims if needed)
+        # Using q_head_dim for MHA/Prefill scale
+        self.mha_scale = self.q_head_dim**-0.5
+        # Using combined dim for MQA/Decode scale
+        self.mqa_scale = (self.kv_lora_rank + self.qk_rope_head_dim)**-0.5
+
+        # Assume causal mask unless configured otherwise
+        self.is_causal = True
 
         # Initialize query projections
         if self.q_lora_rank is None:
-            # Standard Q projection (replace with TE Linear)
-            self.q_proj = te.Linear(
+            # Standard Q projection
+            self.q_proj = nn.Linear(
                 hidden_size, num_heads * self.q_head_dim, bias=False
             )
         else:
-            # Q projection with LoRA (replace with TE Linear/LayerNorm)
-            self.q_a_proj = te.Linear(hidden_size, q_lora_rank, bias=False)
+            # Q projection with LoRA
+            self.q_a_proj = nn.Linear(hidden_size, q_lora_rank, bias=False)
             # Assuming eps=1e-6, adjust if needed
-            self.q_a_layernorm = te.LayerNorm(q_lora_rank, eps=1e-6)
-            self.q_b_proj = te.Linear(
+            self.q_a_layernorm = nn.LayerNorm(q_lora_rank, eps=1e-6)
+            self.q_b_proj = nn.Linear(
                 q_lora_rank, num_heads * self.q_head_dim, bias=False
             )
 
         # Key-value projections (MLA specific)
-        # (replace with TE Linear/LayerNorm)
         # Projects hidden_states to latent kv_c and k_pe
-        self.kv_a_proj_with_mqa = te.Linear(
+        self.kv_a_proj_with_mqa = nn.Linear(
             hidden_size, kv_lora_rank + qk_rope_head_dim, bias=False
         )
         # LayerNorm for the compressed kv_c part
         # Assuming eps=1e-6
-        self.kv_a_layernorm = te.LayerNorm(kv_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = nn.LayerNorm(kv_lora_rank, eps=1e-6)
 
         # Projects normalized kv_c to k_nope and v
-        self.kv_b_proj = te.Linear(
+        self.kv_b_proj = nn.Linear(
             kv_lora_rank,
             # Output includes nope part of K and the V part
             num_heads * (self.qk_nope_head_dim + v_head_dim),
             bias=False,
         )
 
-        # Output projection (replace with TE Linear)
-        self.o_proj = te.Linear(num_heads * v_head_dim, hidden_size, bias=False)
+        # Output projection
+        self.o_proj = nn.Linear(num_heads * v_head_dim, hidden_size, bias=False)
 
         # Precompute weights for decode path (MQA-like projections)
-        # These need to be updated if kv_b_proj weights change
-        # (e.g., after loading checkpoint)
-        self.W_UV = None
-        self.W_UK_T = None
+        # Register as buffers to ensure they move with the model (.to(device))
+        self.register_buffer('W_UV', None, persistent=False)
+        self.register_buffer('W_UK_T', None, persistent=False)
         self._prepare_kv_weights()  # Attempt initial preparation
 
     def _prepare_kv_weights(self):
@@ -220,20 +252,19 @@ class MultiHeadedLatentAttention(nn.Module):
             W_UK, W_UV = kv_b_proj_weight.split(
                 [self.qk_nope_head_dim, self.v_head_dim], dim=1
             )
+            # target_device = kv_b_proj_weight.device # No longer needed, buffer handles device
 
+            # Assign computed tensors to the registered buffers
             # W_UV needs shape [num_heads, kv_lora_rank, v_dim] for bmm
             self.W_UV = W_UV.permute(0, 2, 1).contiguous()
-            # W_UK_T needs shape [num_heads, qk_nope, kv_lora_rank] for bmm
-            # (VLLM uses permute(1, 2, 0) on (L, N, P) -> (N, P, L))
-            # Here W_UK is (N, P, L), so we need transpose(1, 2) -> (N, L, P)?
-            # No, bmm expects (N, B, P) x (N, P, L)
-            # Let's stick to VLLM's naming convention for clarity
-            # W_UK_T = W_UK.transpose(1, 2)
-            # q_nope (N, B, P) @ W_UK_T (N, P, L) -> ql_nope (N, B, L)
-            # Shape [num_heads, qk_nope_head_dim, kv_lora_rank]
+            # W_UK_T needs shape [num_heads, qk_nope_head_dim, kv_lora_rank] for bmm
             self.W_UK_T = W_UK.contiguous()
 
-            print("Successfully prepared W_UV and W_UK_T for MLA decode.")
+            # Log the device of the created buffers for confirmation
+            if self.W_UV is not None and self.W_UK_T is not None:
+                 print(f"Successfully prepared W_UV ({self.W_UV.device}) and W_UK_T ({self.W_UK_T.device}) for MLA decode.")
+            else:
+                 print("Failed to prepare W_UV and W_UK_T buffers.")
         except Exception as e:
             print(
                 f"Warning: Failed to prepare W_UV and W_UK_T: {e}. "
@@ -412,243 +443,237 @@ class MultiHeadedLatentAttention(nn.Module):
         kv_seq_len = kv_c_for_attn.shape[1]
 
         # --- Prepare inputs for Attention Calculation ---
-        # Reshape query_states for FA:
-        # [bsz * q_len, num_heads, q_head_dim] or
-        # [total_tokens, num_heads, q_head_dim]
-        # FA expects sequence layout: (total_tokens, num_heads, head_dim)
-        query_states = query_states.reshape(-1, self.num_heads, self.q_head_dim)
+        # Reshape query_states for consistency (though individual paths might reshape again)
+        # query_states shape: [bsz, q_len, num_heads, q_head_dim]
 
-        # Determine attention mode (Prefill vs Decode) - simplified check
+        # Determine attention mode (Prefill vs Decode)
         is_decode = q_len == 1 and past_key_value is not None
 
         # Will hold the input to the final o_proj
         attn_output_proj_input = None
 
-        # Need cu_seqlens_q and cu_seqlens_k for flash_attn_varlen_func
-        # if bsz > 1
-        # For standard training loop with batching, assume all sequences
-        # in batch have same length for now.
-        # If using packing/variable lengths, this needs adjustment.
-        # cu_seqlens_q: Cumulative sequence lengths for queries in batch.
-        # cu_seqlens_k: Cumulative sequence lengths for keys/values in batch.
-        cu_seqlens_q = torch.arange(
-            0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=device
-        )
-        cu_seqlens_k = torch.arange(
-            0, (bsz + 1) * kv_seq_len, step=kv_seq_len, dtype=torch.int32, device=device
-        )
-        max_seqlen_q = q_len
-        max_seqlen_k = kv_seq_len
+        # --- Attention Calculation ---
 
-        if HAS_FLASH_ATTN:
-            # --- FlashAttention Path ---
-            if is_decode:
-                # Decode Path (Data-Movement Friendly - MQA style)
-                # Project q_nope using W_UK_T to get
-                # ql_nope [bsz, q_len, num_heads, kv_lora_rank]
+        if is_decode:
+            # --- Decode Path (q_len=1) ---
+
+            # Ensure decode weights are prepared
+            if self.W_UK_T is None or self.W_UV is None:
+                self._prepare_kv_weights()
                 if self.W_UK_T is None or self.W_UV is None:
-                    # Attempt to prepare weights again if they weren't ready initially
-                    self._prepare_kv_weights()
-                    # If still None after trying again, raise error
-                    if self.W_UK_T is None or self.W_UV is None:
-                        raise RuntimeError(
-                            "MLA decode weights (W_UK_T, W_UV) were not successfully prepared. "
-                            "Ensure post_weight_load() is called after model initialization and weight loading."
-                        )
+                    raise RuntimeError(
+                        "MLA decode weights (W_UK_T, W_UV) were not successfully prepared. "
+                        "Ensure post_weight_load() is called after model initialization and weight loading."
+                    )
 
-                # q_nope: [bsz, q_len, num_heads, qk_nope_head_dim]
-                # W_UK_T: [num_heads, qk_nope_head_dim, kv_lora_rank]
-                # Need batch matrix multiply per head
-                # [bsz, num_heads, q_len, qk_nope]
-                q_nope_reshaped = q_nope.permute(0, 2, 1, 3)
-                # [bsz, num_heads, q_len, kv_lora_rank]
-                ql_nope = torch.matmul(q_nope_reshaped, self.W_UK_T)
+            # Project q_nope using W_UK_T
+            # q_nope: [bsz, 1, num_heads, qk_nope_head_dim] -> [bsz, num_heads, 1, qk_nope_head_dim]
+            q_nope_reshaped = q_nope.permute(0, 2, 1, 3)
+            # W_UK_T: [num_heads, qk_nope_head_dim, kv_lora_rank]
+            # ql_nope: [bsz, num_heads, 1, kv_lora_rank]
+            ql_nope = torch.matmul(q_nope_reshaped, self.W_UK_T)
 
-                # q_pe_rotated: [bsz, q_len, num_heads, qk_rope_head_dim] ->
-                # [bsz, num_heads, q_len, qk_rope_head_dim]
-                q_pe_rotated_reshaped = q_pe_rotated.permute(0, 2, 1, 3)
+            # q_pe_rotated: [bsz, 1, num_heads, qk_rope_head_dim] -> [bsz, num_heads, 1, qk_rope_head_dim]
+            q_pe_rotated_reshaped = q_pe_rotated.permute(0, 2, 1, 3)
 
-                # Combine ql_nope and q_pe_rotated for MQA query
-                # q_mqa: [bsz, num_heads, q_len,
-                #         kv_lora_rank + qk_rope_head_dim]
-                q_mqa = torch.cat([ql_nope, q_pe_rotated_reshaped], dim=-1)
-                # [total_q_tokens, num_heads, head_dim_mqa]
-                q_mqa = q_mqa.reshape(
-                    -1, self.num_heads, self.kv_lora_rank + self.qk_rope_head_dim
-                )
+            # Combine ql_nope and q_pe_rotated for MQA query
+            # q_mqa: [bsz, num_heads, 1, kv_lora_rank + qk_rope_head_dim]
+            q_mqa = torch.cat([ql_nope, q_pe_rotated_reshaped], dim=-1)
 
-                # Prepare K and V for MQA using the potentially cached states
-                # k_pe_for_attn: [bsz, kv_seq_len, qk_rope_head_dim]
-                # kv_c_for_attn: [bsz, kv_seq_len, kv_lora_rank]
-                # Reshape for FA MQA:
-                # [total_kv_tokens, num_kv_heads=1, head_dim]
-                k_pe_mqa = k_pe_for_attn.reshape(-1, 1, self.qk_rope_head_dim)
-                kv_c_mqa = kv_c_for_attn.reshape(-1, 1, self.kv_lora_rank)
+            # Prepare K and V for MQA using the potentially cached states
+            # k_pe_for_attn: [bsz, kv_seq_len, qk_rope_head_dim]
+            # kv_c_for_attn: [bsz, kv_seq_len, kv_lora_rank]
 
-                # k_mqa: [total_kv_tokens, 1,
-                #         kv_lora_rank + qk_rope_head_dim]
-                k_mqa = torch.cat([kv_c_mqa, k_pe_mqa], dim=-1)
-                # v_mqa: [total_kv_tokens, 1, kv_lora_rank]
-                # (Value is the compressed latent vector)
-                v_mqa = kv_c_mqa
+            # k_mqa: [bsz, kv_seq_len, 1, kv_lora_rank + qk_rope_head_dim]
+            k_mqa = torch.cat([
+                kv_c_for_attn.unsqueeze(2), # Add num_kv_heads dim
+                k_pe_for_attn.unsqueeze(2)  # Add num_kv_heads dim
+            ], dim=-1)
+            # v_mqa: [bsz, kv_seq_len, 1, kv_lora_rank] (Value is the compressed latent vector)
+            v_mqa = kv_c_for_attn.unsqueeze(2) # Add num_kv_heads dim
 
-                # Perform MQA using flash_attn_varlen_func
-                # Output shape: [total_q_tokens, num_heads, kv_lora_rank]
-                # (V dim = kv_lora_rank)
-                attn_output_mqa = flash_attn_varlen_func(
-                    q=q_mqa,
-                    k=k_mqa,
-                    v=v_mqa,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    dropout_p=0.0,  # No dropout during inference
-                    # Scale should be based on the MQA query dimension used in dot product
-                    softmax_scale=(self.kv_lora_rank + self.qk_rope_head_dim)**-0.5,
-                    causal=True,  # Causal mask needed
-                )
-                # attn_output_mqa shape:
-                # [bsz * q_len, num_heads, kv_lora_rank]
+            # Check conditions for FlashAttention MQA
+            use_flash_decode = (
+                HAS_FLASH_ATTN
+                and hidden_states.dtype in [torch.float16, torch.bfloat16]
+                # Flash MQA requires K/V head dim == V head dim used in calculation
+                # Here, V is kv_c_mqa (kv_lora_rank), K is combined (kv_lora_rank + qk_rope_head_dim)
+                # FlashAttention MQA typically expects K_dim == V_dim.
+                # Let's use SDPA for decode path for simplicity and correctness,
+                # as the MQA structure here doesn't map directly to standard Flash MQA kernel expectations.
+                # Set to False to always use SDPA for decode.
+                # and False # Force SDPA for decode MQA path
+            )
+            # <<< EDIT: Force SDPA for decode path due to complexity >>>
+            use_flash_decode = False
 
-                # Apply final projection (VLLM's _v_up_proj_and_o_proj logic)
-                # Reshape to [bsz*q_len, num_heads, kv_lora_rank] ->
-                # [num_heads, bsz*q_len, kv_lora_rank]
-                attn_output_mqa = attn_output_mqa.transpose(0, 1)
-                # W_UV shape: [num_heads, kv_lora_rank, v_head_dim]
-                # Output: [num_heads, bsz*q_len, v_head_dim]
-                projected_output = torch.bmm(attn_output_mqa, self.W_UV)
-                # Reshape back: [bsz*q_len, num_heads * v_head_dim]
-                projected_output = projected_output.transpose(0, 1).reshape(
-                    -1, self.num_heads * self.v_head_dim
-                )
-                attn_output_proj_input = projected_output
 
-            else:
-                # Prefill Path (Compute Friendly - MHA style)
-                # Project kv_c_for_attn (potentially cached) to get k_nope
-                # and v
-                # kv_c_for_attn shape: [bsz, kv_seq_len, kv_lora_rank]
-                # kv_b_proj input needs shape [*, kv_lora_rank]
-                # TE Linear returns tensor
-                kv_b_out = self.kv_b_proj(kv_c_for_attn.view(-1, self.kv_lora_rank))
-                # Reshape output:
-                # [bsz, kv_seq_len, num_heads, qk_nope + v_dim]
-                kv_b_out = kv_b_out.view(
-                    bsz,
-                    kv_seq_len,
-                    self.num_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                )
-                # Split into k_nope and v
-                # k_nope: [bsz, kv_seq_len, num_heads, qk_nope_head_dim]
-                # v: [bsz, kv_seq_len, num_heads, v_head_dim]
-                k_nope, v = torch.split(
-                    kv_b_out, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-                )
+            if use_flash_decode:
+                 # --- FlashAttention Decode Path (Currently Disabled) ---
+                 # This path would require careful reshaping and potentially custom kernels
+                 # to match the specific MQA structure (different K/V dims).
+                 # logger.warning("FlashAttention Decode Path for MLA is complex and currently disabled. Using SDPA.")
+                 pass # Keep SDPA as the primary decode path for now
+                 # ... (Original flash_attn_varlen_func call for decode would go here if enabled)
 
-                # Combine k_nope and k_pe_for_attn (potentially cached)
-                # k_pe_for_attn: [bsz, kv_seq_len, qk_rope_head_dim] ->
-                # expand for heads
-                k_pe_expanded = k_pe_for_attn.unsqueeze(2).expand(
-                    -1, -1, self.num_heads, -1
-                )
-                # k: [bsz, kv_seq_len, num_heads, q_head_dim]
-                k = torch.cat([k_nope, k_pe_expanded], dim=-1)
+            # --- SDPA Decode Path ---
+            # q_mqa: [bsz, num_heads, 1, kv_lora_rank + qk_rope_head_dim]
+            # k_mqa: [bsz, kv_seq_len, 1, kv_lora_rank + qk_rope_head_dim]
+            # v_mqa: [bsz, kv_seq_len, 1, kv_lora_rank]
 
-                # Reshape K and V for FlashAttention:
-                # [total_kv_tokens, num_heads, head_dim]
-                k = k.reshape(-1, self.num_heads, self.q_head_dim)
-                v = v.reshape(-1, self.num_heads, self.v_head_dim)
+            # Repeat K/V if num_key_value_heads (1) < num_heads
+            k_mqa_sdpa = repeat_kv(k_mqa, self.num_key_value_groups) # [bsz, kv_seq_len, num_heads, k_dim]
+            v_mqa_sdpa = repeat_kv(v_mqa, self.num_key_value_groups) # [bsz, kv_seq_len, num_heads, v_dim]
 
-                # Pad V if v_head_dim < q_head_dim
-                if self.v_head_dim < self.q_head_dim:
-                    padding_size = self.q_head_dim - self.v_head_dim
-                    v_padded = F.pad(v, (0, padding_size))
-                else:
-                    # Should be equal if q_head_dim == qk_nope + qk_rope
-                    v_padded = v
+            # Transpose for SDPA: [bsz, num_heads, seq_len, head_dim]
+            q_mqa_sdpa = q_mqa # Already [bsz, num_heads, 1, k_dim]
+            k_mqa_sdpa = k_mqa_sdpa.transpose(1, 2) # [bsz, num_heads, kv_seq_len, k_dim]
+            v_mqa_sdpa = v_mqa_sdpa.transpose(1, 2) # [bsz, num_heads, kv_seq_len, v_dim]
 
-                # Perform MHA using flash_attn_varlen_func
-                # Output shape: [total_q_tokens, num_heads, q_head_dim]
-                # (V dim = padded V dim)
-                attn_output_padded = flash_attn_varlen_func(
-                    # Shape: [total_q_tokens, num_heads, q_head_dim]
-                    q=query_states,
-                    # Shape: [total_kv_tokens, num_heads, q_head_dim]
-                    k=k,
-                    # Shape: [total_kv_tokens, num_heads, q_head_dim]
-                    v=v_padded,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    dropout_p=self.dropout_p if self.training else 0.0,
-                    softmax_scale=self.softmax_scale,
-                    causal=True,
-                )
+            # SDPA calculation
+            attn_output_mqa = scaled_dot_product_attention(
+                q_mqa_sdpa,
+                k_mqa_sdpa,
+                v_mqa_sdpa,
+                attn_mask=None, # Use is_causal for decode
+                dropout_p=0.0,
+                is_causal=True, # Correct for decode
+                scale=self.mqa_scale, # Use MQA scale
+            ) # Output: [bsz, num_heads, 1, kv_lora_rank]
 
-                # Slice off padding from output and reshape
-                # attn_output shape: [total_q_tokens, num_heads, v_head_dim]
-                attn_output_unpadded = attn_output_padded[..., : self.v_head_dim]
-                # Reshape to [total_q_tokens, num_heads * v_head_dim]
-                attn_output_proj_input = attn_output_unpadded.reshape(
-                    -1, self.num_heads * self.v_head_dim
-                )
+            # Transpose back: [bsz, 1, num_heads, kv_lora_rank]
+            attn_output_mqa = attn_output_mqa.transpose(1, 2)
+
+            # Apply final projection (VLLM's _v_up_proj_and_o_proj logic)
+            # Reshape to [bsz*1, num_heads, kv_lora_rank] -> [num_heads, bsz*1, kv_lora_rank]
+            attn_output_mqa = attn_output_mqa.reshape(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+            # W_UV shape: [num_heads, kv_lora_rank, v_head_dim]
+            # Output: [num_heads, bsz*1, v_head_dim]
+            projected_output = torch.bmm(attn_output_mqa, self.W_UV)
+            # Reshape back: [bsz*1, num_heads * v_head_dim]
+            attn_output_proj_input = projected_output.transpose(0, 1).reshape(
+                -1, self.num_heads * self.v_head_dim
+            )
 
         else:
-            # --- Fallback to torch.nn.functional.scaled_dot_product_attention --- # noqa
-            # This path won't implement the specific MLA projections
-            # (MQA decode) easily.
-            # It will perform standard MHA based on the projected Q, K, V
-            # derived from combined states.
-            # This serves as a functional fallback if FlashAttention is not
-            # available.
+            # --- Prefill Path (q_len > 1) ---
 
-            # Project kv_c_for_attn to get k_nope and v
-            # (same as prefill path above)
-            # TE Linear returns tensor
+            # Project kv_c_for_attn (potentially cached) to get k_nope and v
             kv_b_out = self.kv_b_proj(kv_c_for_attn.view(-1, self.kv_lora_rank))
             kv_b_out = kv_b_out.view(
                 bsz, kv_seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
+            # Split into k_nope and v
+            # k_nope: [bsz, kv_seq_len, num_heads, qk_nope_head_dim]
+            # v: [bsz, kv_seq_len, num_heads, v_head_dim]
             k_nope, v = torch.split(
                 kv_b_out, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
             )
 
             # Combine k_nope and k_pe_for_attn (potentially cached)
+            # k_pe_for_attn: [bsz, kv_seq_len, qk_rope_head_dim] -> expand for heads
             k_pe_expanded = k_pe_for_attn.unsqueeze(2).expand(
                 -1, -1, self.num_heads, -1
             )
-            # [bsz, kv_seq_len, num_heads, q_head_dim]
+            # k: [bsz, kv_seq_len, num_heads, q_head_dim]
             k = torch.cat([k_nope, k_pe_expanded], dim=-1)
 
-            # Reshape Q, K, V for scaled_dot_product_attention:
-            # [bsz, num_heads, seq_len, head_dim]
-            query_states_sdpa = query_states.reshape(
-                bsz, q_len, self.num_heads, self.q_head_dim
-            ).transpose(1, 2)
-            key_states_sdpa = k.transpose(1, 2)
-            value_states_sdpa = v.transpose(1, 2)
-
-            # scaled_dot_product_attention expects attention_mask:
-            # [bsz, num_heads, q_len, k_len]
-            # Need to adapt the input attention_mask if it's 2D or None
-            # Assuming causal mask is needed
-            attn_output_sdpa = scaled_dot_product_attention(
-                query_states_sdpa,
-                key_states_sdpa,
-                value_states_sdpa,
-                # Let SDPA handle causal mask based on is_causal=True
-                attn_mask=None,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=True,  # Enable causal masking
-            )  # Output: [bsz, num_heads, q_len, v_head_dim]
-
-            # Reshape output: [bsz, q_len, num_heads * v_head_dim]
-            attn_output_proj_input = (
-                attn_output_sdpa.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+            # Check conditions for FlashAttention MHA
+            use_flash_prefill = (
+                HAS_FLASH_ATTN
+                and hidden_states.dtype in [torch.float16, torch.bfloat16]
+                # Flash MHA requires Q, K, V head dims to be compatible.
+                # V head dim might differ from Q/K head dim.
+                # Check if flash_attn_varlen_func supports this.
+                # Assuming it requires Q_dim == K_dim == V_dim for simplicity.
+                # If v_head_dim != q_head_dim, we must use SDPA.
+                and self.v_head_dim == self.q_head_dim
+                # FlashAttention needs mask info via cu_seqlens or specific mask format.
+                # Using SDPA if mask format is incompatible or complex.
+                # Let's simplify and use SDPA if any mask is present.
+                and attention_mask is None and self.is_causal # Only use flash for causal w/o explicit mask
             )
+
+            if use_flash_prefill:
+                # --- FlashAttention Prefill Path ---
+                # Reshape Q, K, V for FlashAttention: [total_tokens, num_heads, head_dim]
+                # Requires sequence packing logic (cu_seqlens) if attention_mask is not None
+                # Assuming causal mask and no padding for simplicity here.
+                # If padding/variable lengths are used, this needs packing logic.
+
+                # Reshape Q, K, V for FlashAttention: [total_tokens, num_heads, head_dim]
+                query_states_fa = query_states.reshape(-1, self.num_heads, self.q_head_dim)
+                key_states_fa = k.reshape(-1, self.num_heads, self.q_head_dim)
+                value_states_fa = v.reshape(-1, self.num_heads, self.v_head_dim) # v_head_dim == q_head_dim here
+
+                # Create cu_seqlens if needed (assuming no padding here)
+                cu_seqlens_q = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=device)
+                cu_seqlens_k = torch.arange(0, (bsz + 1) * kv_seq_len, step=kv_seq_len, dtype=torch.int32, device=device)
+                max_seqlen_q = q_len
+                max_seqlen_k = kv_seq_len
+
+                attn_output_fa = flash_attn_varlen_func(
+                    q=query_states_fa,
+                    k=key_states_fa,
+                    v=value_states_fa,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                    softmax_scale=self.mha_scale, # Use MHA scale
+                    causal=self.is_causal,
+                ) # Output: [total_q_tokens, num_heads, v_head_dim]
+
+                # Reshape to [total_q_tokens, num_heads * v_head_dim]
+                attn_output_proj_input = attn_output_fa.reshape(
+                    -1, self.num_heads * self.v_head_dim
+                )
+
+            else:
+                # --- SDPA Prefill Path ---
+                # Reshape Q, K, V for scaled_dot_product_attention: [bsz, num_heads, seq_len, head_dim]
+                query_states_sdpa = query_states.transpose(1, 2)
+                # K and V might need repeating if num_kv_heads < num_heads (though MLA uses 1 KV head conceptually)
+                # The projection `kv_b_proj` already outputs `num_heads` for k_nope and v.
+                key_states_sdpa = k.transpose(1, 2)
+                value_states_sdpa = v.transpose(1, 2)
+
+                # Prepare attention mask for SDPA
+                sdpa_mask = attention_mask
+                # SDPA expects mask broadcastable to [bsz, num_heads, q_len, kv_seq_len]
+                if sdpa_mask is not None:
+                    if sdpa_mask.dim() == 2: # e.g., [bsz, kv_seq_len]
+                        sdpa_mask = sdpa_mask[:, None, None, :].expand(bsz, self.num_heads, q_len, kv_seq_len)
+                    elif sdpa_mask.dim() == 3: # e.g., [bsz, q_len, kv_seq_len]
+                        sdpa_mask = sdpa_mask[:, None, :, :].expand(bsz, self.num_heads, q_len, kv_seq_len)
+                    # Ensure mask is boolean or float
+                    if sdpa_mask.dtype != torch.bool:
+                         # Assuming 0 means attend, < 0 means mask
+                         sdpa_mask = sdpa_mask < 0
+                # If mask is None, is_causal flag handles causal masking
+
+                attn_output_sdpa = scaled_dot_product_attention(
+                    query_states_sdpa,
+                    key_states_sdpa,
+                    value_states_sdpa,
+                    attn_mask=sdpa_mask,
+                    dropout_p=self.dropout_p if self.training else 0.0,
+                    # Use is_causal only if no explicit mask is provided
+                    is_causal=self.is_causal and sdpa_mask is None,
+                    scale=self.mha_scale, # Use MHA scale
+                ) # Output: [bsz, num_heads, q_len, v_head_dim]
+
+                # Reshape output: [bsz, q_len, num_heads * v_head_dim]
+                attn_output_proj_input = (
+                    attn_output_sdpa.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+                )
+
+        # --- Final Output Projection ---
+        # attn_output_proj_input shape: [bsz * q_len, num_heads * v_head_dim] or [bsz, q_len, num_heads * v_head_dim]
+        # Ensure input is 2D or 3D as expected by o_proj
+        if attn_output_proj_input.dim() == 3: # If SDPA path returned 3D tensor
+             attn_output_proj_input = attn_output_proj_input.view(-1, self.num_heads * self.v_head_dim)
 
         # --- Final Output Projection ---
         # attn_output_proj_input shape:

@@ -10,9 +10,13 @@ that handles command line argument parsing and configuration loading.
 
 import argparse
 import logging
+import os
+import sys
 
 from llm.training.train import TrainerConfig, run_training
 
+# Configure logger
+logger = logging.getLogger(__name__)
 
 def main():
     """Main entry point for the training script."""
@@ -24,7 +28,29 @@ def main():
     parser.add_argument(
         "--max-steps", type=int, default=None, help="Override max_steps in config"
     )
+    parser.add_argument(
+        "--extra-index-url", type=str, default=None, 
+        help="Extra PyPI index URL for PyTorch nightly builds"
+    )
     args = parser.parse_args()
+
+    # Handle PyTorch nightly builds if specified
+    if args.extra_index_url:
+        logger.info(f"Using extra index URL for PyTorch: {args.extra_index_url}")
+        # This is just informational as the packages should already be installed
+        # by the train.sh script, but we can verify PyTorch is available
+        try:
+            import torch
+            logger.info(f"Using PyTorch version: {torch.__version__}")
+            if hasattr(torch.cuda, 'is_available') and torch.cuda.is_available():
+                logger.info(f"CUDA available: {torch.cuda.is_available()}")
+                logger.info(f"CUDA version: {torch.version.cuda}")
+                logger.info(f"GPU device count: {torch.cuda.device_count()}")
+                for i in range(torch.cuda.device_count()):
+                    logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        except ImportError:
+            logger.warning("PyTorch not found. Please install it using the specified index URL.")
+            sys.exit(1)
 
     # Load configuration
     config = TrainerConfig.from_yaml(args.config)

@@ -17,8 +17,8 @@ echo "Targeting Python version: ${PYTHON_VERSION}"
 
 # CUDA
 # WARNING: CUDA 12.8 is not a standard build target for many packages. Compatibility issues may arise.
-export CUDA_VERSION=${CUDA_VERSION:-12.8.90}
-export CUDA_SHORT=${CUDA_VERSION%.*}
+export CUDA_VERSION=${CUDA_VERSION:-12.8} # Default to 12.8 to match cu128 index
+export CUDA_SHORT=${CUDA_VERSION%.*} # Will be 12.8
 export CUDA_TAG=cu${CUDA_SHORT//./}
 export CUDA_RELEASE=${CUDA_SHORT//./-}
 echo "Targeting CUDA version: ${CUDA_VERSION} (${CUDA_TAG})"
@@ -122,8 +122,7 @@ reset_repo () {
 echo "Installing base build tools..."
 # Install build deps that aren't in project requirements files
 # Make sure to upgrade setuptools to avoid triton build bug
-# Pin setuptools version known to work with older Triton if needed
-uv pip install -U build cmake ninja pybind11 "setuptools<70" wheel
+uv pip install -U build cmake ninja pybind11 "setuptools<=76" wheel
 
 pushd src > /dev/null
 
@@ -169,7 +168,7 @@ fi
 
 # --- PyTorch ---
 export TORCH_REPO=${TORCH_REPO:-https://github.com/pytorch/pytorch.git}
-export TORCH_REF=${TORCH_REF:-v2.6.0} # Use a recent stable release
+export TORCH_REF=${TORCH_REF:-v2.6.0-rc9} # Use a recent stable release
 export TORCH_BUILD_VERSION=${TORCH_BUILD_VERSION:-${TORCH_REF#v}+${CUDA_TAG}}
 export PYTORCH_BUILD_VERSION=${TORCH_BUILD_VERSION:-${TORCH_REF#v}+${CUDA_TAG}}
 export PYTORCH_BUILD_NUMBER=0
@@ -181,30 +180,34 @@ if ! [[ -v SKIP_TORCH ]]; then
             # Use NVPL Blis on ARM64 (alternative to OpenBLAS/MKL)
             export BLAS=NVPL
             echo "Set BLAS=NVPL for ARM64 PyTorch build."
-            # XNNPACK patch might not be needed for v2.6.0, remove for now. Add back if build fails.
-            # echo "Patching XNNPACK submodule..."
-            # pushd third_party/XNNPACK > /dev/null
-            #     git checkout fcc06d1
-            # popd > /dev/null
         fi
         echo "Installing PyTorch build requirements..."
         uv pip install -r requirements.txt
+        echo "Setting CMAKE_ARGS for PyTorch build..."
+        export CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
         echo "Starting PyTorch build (version ${PYTORCH_BUILD_VERSION})..."
-        # Set CMake policy version minimum to fix protobuf configuration issue
-        export CMAKE_ARGS="${CMAKE_ARGS:-} -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-        # Use setup.py build method as recommended by PyTorch docs for custom builds
-        python setup.py build
-        echo "Creating PyTorch wheel..."
-        python setup.py bdist_wheel -d ${WHEELS}
-        # uv build --wheel --no-build-isolation -o ${WHEELS} # uv build might work but setup.py is safer
+        # Build PyTorch using uv build
+        uv build --wheel --no-build-isolation -o ${WHEELS}
         echo "PyTorch build finished."
         # Install immediately to satisfy subsequent builds
         echo "Installing built PyTorch wheel..."
-        uv pip install --no-deps ${WHEELS}/torch*.whl
+        TORCH_WHEEL=$(find ${WHEELS} -name "torch*.whl")
+        if [[ -z "${TORCH_WHEEL}" ]]; then
+            echo "Error: PyTorch wheel not found in ${WHEELS}"
+            exit 1
+        fi
+        uv pip install --no-deps ${TORCH_WHEEL}
+        # Unset CMAKE_ARGS after PyTorch build to avoid affecting other builds
+        unset CMAKE_ARGS
     popd > /dev/null
 else
     echo "Skipping PyTorch build as SKIP_TORCH is set. Installing from ${WHEELS}..."
-    uv pip install --no-deps ${WHEELS}/torch*.whl || { echo "Failed to install pre-built PyTorch wheel."; exit 1; }
+    TORCH_WHEEL=$(find ${WHEELS} -name "torch*.whl")
+    if [[ -z "${TORCH_WHEEL}" ]]; then
+        echo "Error: PyTorch wheel not found in ${WHEELS}"
+        exit 1
+    fi
+    uv pip install --no-deps ${TORCH_WHEEL}
 fi
 
 # --- TorchAudio ---
@@ -241,44 +244,21 @@ else
     echo "Skipping TorchVision build as SKIP_VISION is set."
 fi
 
-# --- Triton ---
-export TRITON_REPO=${TRITON_REPO:-https://github.com/triton-lang/triton.git}
-export TRITON_REF=${TRITON_REF:-release/3.2.x} # Use a recent release branch
-# Extract version from ref if possible, otherwise set manually
-TRITON_VERSION_FROM_REF=$(echo ${TRITON_REF} | grep -oP '(?<=/)\d+\.\d+(\.\d+)?')
-export TRITON_VERSION=${TRITON_VERSION:-${TRITON_VERSION_FROM_REF:-3.2.0}} # Default if extraction fails
-export TRITON_BUILD_VERSION=${TRITON_BUILD_VERSION:-${TRITON_VERSION}+${CUDA_TAG}}
-if ! [[ -v SKIP_TRITON ]]; then
-    echo "Building Triton ${TRITON_REF}..."
-    reset_repo ${TRITON_REPO} ${TRITON_REF}
-    pushd triton/python > /dev/null
-        # Override package version in setup.py
-        echo "Overriding Triton version in setup.py to ${TRITON_BUILD_VERSION}"
-        sed -i.bak "s/version=.*,/version=\"${TRITON_BUILD_VERSION}\",/" setup.py
-        echo "Starting Triton build..."
-        # Triton build might need specific env vars or cmake args, check their docs if build fails
-        uv build --wheel --no-build-isolation -o ${WHEELS}
-        echo "Triton build finished."
-    popd > /dev/null
-else
-    echo "Skipping Triton build as SKIP_TRITON is set."
-fi
 
 # --- FlashAttention ---
 # Needs specific build flags
 export FLASH_ATTENTION_FORCE_BUILD=1
+export FLASH_ATTENTION_WITH_CUDA=1
 export FLASH_ATTN_REPO=${FLASH_ATTN_REPO:-https://github.com/Dao-AILab/flash-attention.git}
 export FLASH_ATTN_REF=${FLASH_ATTN_REF:-v2.7.4.post1} # Use a known tag or main
-export FLASH_ATTN_BUILD_VERSION=${FLASH_ATTN_BUILD_VERSION:-${FLASH_ATTN_REF#v}+${CUDA_TAG}}
 # FlashAttention doesn't use BUILD_VERSION directly, relies on setup.py logic
 if ! [[ -v SKIP_FLASH_ATTN ]]; then
     echo "Building FlashAttention ${FLASH_ATTN_REF}..."
     reset_repo ${FLASH_ATTN_REPO} ${FLASH_ATTN_REF}
     pushd flash-attention > /dev/null
-        # Override version in setup.py if needed (check setup.py structure)
-        # Example: sed -i.bak "s/^version = .*/version = \"${FLASH_ATTN_BUILD_VERSION}\"/" setup.py
         echo "Starting FlashAttention build..."
-        # FlashAttention build might need specific env vars like MAX_JOBS
+        # FlashAttention build needs specific env vars
+        export MAX_JOBS=${MAX_JOBS}
         # It uses TORCH_CUDA_ARCH_LIST automatically
         uv build --wheel --no-build-isolation -o ${WHEELS}
         echo "FlashAttention build finished."
@@ -287,25 +267,10 @@ else
     echo "Skipping FlashAttention build as SKIP_FLASH_ATTN is set."
 fi
 
-# --- Transformer Engine ---
-export TE_REPO=${TE_REPO:-https://github.com/NVIDIA/TransformerEngine.git}
-export TE_REF=${TE_REF:-v1.9.0} # Use a recent tag or main
-export TE_BUILD_VERSION=${TE_BUILD_VERSION:-${TE_REF#v}+${CUDA_TAG}}
-# Transformer Engine uses NVTE_BUILD_VERSION
-export NVTE_BUILD_VERSION=${TE_BUILD_VERSION}
-if ! [[ -v SKIP_TE ]]; then
-    echo "Building Transformer Engine ${TE_REF}..."
-    reset_repo ${TE_REPO} ${TE_REF}
-    pushd TransformerEngine > /dev/null
-        echo "Starting Transformer Engine build..."
-        # Transformer Engine build might need specific env vars, check their docs
-        # It uses TORCH_CUDA_ARCH_LIST automatically
-        uv build --wheel --no-build-isolation -o ${WHEELS}
-        echo "Transformer Engine build finished."
-    popd > /dev/null
-else
-    echo "Skipping Transformer Engine build as SKIP_TE is set."
-fi
+# --- Install float8_experimental ---
+echo "Installing float8_experimental from GitHub..."
+uv pip install git+https://github.com/pytorch-labs/float8_experimental.git
+echo "float8_experimental installation complete."
 
 
 popd > /dev/null # Exit src directory
@@ -313,15 +278,32 @@ popd > /dev/null # Exit src directory
 # --- Final Installation ---
 
 echo "Installing all built wheels from ${WHEELS}..."
+# Check if wheels directory has any wheels
+if [ ! "$(ls -A ${WHEELS})" ]; then
+    echo "Error: No wheels found in ${WHEELS} directory!"
+    exit 1
+fi
+
 # Install all wheels built, respecting dependencies if possible
-# Use --no-deps initially if installing torch separately worked, then install others
-# Or install all together and let uv resolve
+# First install torch if it exists
+TORCH_WHEEL=$(find ${WHEELS} -name "torch*.whl" | grep -v "torchaudio\|torchvision" | head -n 1)
+if [[ -n "${TORCH_WHEEL}" ]]; then
+    echo "Installing PyTorch wheel: ${TORCH_WHEEL}"
+    uv pip install --no-deps "${TORCH_WHEEL}"
+fi
+
+# Then install all other wheels
+echo "Installing remaining wheels..."
 uv pip install ${WHEELS}/*.whl
 
 echo "Installing the llm project..."
 # Install the current project in editable mode, using the built dependencies
 # Use --no-build-isolation as torch is already installed
-uv pip install --no-build-isolation -e ".[dev,evals]"
+if [ -f "setup.py" ]; then
+    uv pip install --no-build-isolation -e ".[dev,evals]"
+else
+    echo "Warning: setup.py not found in current directory. Skipping project installation."
+fi
 
 echo "Build and installation complete!"
 echo "Activate the environment using: source .venv/bin/activate"

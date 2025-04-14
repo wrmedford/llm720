@@ -65,7 +65,7 @@ We recommend using `uv` for faster environment management.
     source .venv/bin/activate
     # Or `source .venv/bin/activate.fish` for fish shell, etc.
     ```
-3.  **Install PyTorch:** Packages like `flash-attn` and `triton` require PyTorch to be installed *before* they are built. Install PyTorch first, matching your CUDA version (see [https://pytorch.org/](https://pytorch.org/)).
+3.  **Install PyTorch:** Packages like `flash-attn` require PyTorch to be installed *before* they are built. Install PyTorch first, matching your CUDA version (see [https://pytorch.org/](https://pytorch.org/)).
     ```bash
     # Example for CUDA 12.1 on x86_64 - Adjust if necessary!
     # uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
@@ -75,15 +75,15 @@ We recommend using `uv` for faster environment management.
     ```
     *Verify the correct CUDA version for your system and drivers.* Find available wheels at [https://pytorch.org/](https://pytorch.org/).
 
-4.  **Install the package and remaining dependencies:** Use `--no-build-isolation` to ensure packages like `flash-attn`, `triton`, and `transformer-engine` can find the already installed PyTorch during their build process.
+4.  **Install the package and remaining dependencies:** Use `--no-build-isolation` to ensure packages like `flash-attn` and `float8_experimental` can find the already installed PyTorch during their build process.
     ```bash
     # For running ablation studies (requires dev and eval dependencies)
-    # This includes flash-attn, triton, transformer-engine, pytest, evals, etc.
+    # This includes flash-attn, float8_experimental, pytest, evals, etc.
     uv pip install --no-build-isolation -e ".[dev,evals]"
 
     # --- OR --- Install only what you need:
 
-    # Base installation (training/inference - includes flash-attn, triton, transformer-engine)
+    # Base installation (training/inference - includes flash-attn, float8_experimental)
     # uv pip install --no-build-isolation -e .
 
     # For development (linters, formatters, testing tools)
@@ -94,16 +94,16 @@ We recommend using `uv` for faster environment management.
     ```
 
     **ARM/GH200 Installation Notes:**
-    - **`flash-attn` and `triton`:** Installation on ARM architectures might fail as pre-built wheels are often unavailable. You may need to:
-        - **Build from source:** Follow the official instructions for `flash-attn` and `triton`, which may require specific compilers (like `gcc`, `g++`) and the CUDA toolkit installed on your system.
-        - **Comment out:** If you don't strictly need the Triton kernels for PEER or FlashAttention for MLA initially, you can temporarily comment out `flash-attn` and `triton` in `setup.py` and reinstall using the command above. The code includes PyTorch fallbacks.
-    - **`transformer-engine`:** Should generally install correctly on ARM/Hopper via pip if compatible wheels exist.
+    - **`flash-attn`:** Installation on ARM architectures might fail as pre-built wheels are often unavailable. You may need to:
+        - **Build from source:** Follow the official instructions for `flash-attn`, which may require specific compilers (like `gcc`, `g++`) and the CUDA toolkit installed on your system.
+        - **Comment out:** If you don't strictly need FlashAttention for MLA initially, you can temporarily comment out `flash-attn` in `setup.py` and reinstall using the command above. The code includes PyTorch fallbacks.
+    - **`float8_experimental`:** Requires a recent PyTorch version (nightly or >= 2.2) with FP8 support. It's installed directly from GitHub.
 
-    If installation fails, check the specific error messages and consult the documentation for `flash-attn`, `triton`, and `transformer-engine`.
+    If installation fails, check the specific error messages and consult the documentation for `flash-attn` and `float8_experimental`.
 
 ## Building Dependencies from Source (Advanced)
 
-In some cases, especially on specific architectures like ARM (e.g., GH200) or when using non-standard CUDA versions (like 12.8), pre-built wheels for dependencies like PyTorch, Triton, FlashAttention, and Transformer Engine might not be available or compatible.
+In some cases, especially on specific architectures like ARM (e.g., GH200) or when using non-standard CUDA versions (like 12.8), pre-built wheels for dependencies like PyTorch and FlashAttention might not be available or compatible.
 
 This project includes a script to build these core dependencies from source tailored to your environment.
 
@@ -123,8 +123,8 @@ This project includes a script to build these core dependencies from source tail
     *   `PYTHON_VERSION`: Target Python version (default: 3.12).
     *   `CUDA_VERSION`: Target CUDA version (default: 12.8.90).
     *   `TORCH_CUDA_ARCH_LIST`: Target GPU architectures (default: 9.0a for Hopper).
-    *   `SKIP_TORCH=1`, `SKIP_TRITON=1`, `SKIP_FLASH_ATTN=1`, `SKIP_TE=1`: Skip building specific components if they are already installed or not needed.
-    *   `TORCH_REF`, `TRITON_REF`, `FLASH_ATTN_REF`, `TE_REF`: Specify git tags/branches for dependencies.
+    *   `SKIP_TORCH=1`, `SKIP_FLASH_ATTN=1`: Skip building specific components if they are already installed or not needed.
+    *   `TORCH_REF`, `FLASH_ATTN_REF`: Specify git tags/branches for dependencies.
 
 2.  **Run the Build Script:**
     ```bash
@@ -132,11 +132,12 @@ This project includes a script to build these core dependencies from source tail
     ```
     This script will:
     *   Set up a virtual environment (`.venv`).
-    *   Clone the source code for PyTorch, Triton, FlashAttention, and Transformer Engine into the `src/` directory.
+    *   Clone the source code for PyTorch and FlashAttention into the `src/` directory.
     *   Build each dependency using the specified CUDA version and architecture flags.
     *   (On ARM) Build the ARM Compute Library.
     *   Place the compiled wheels into the `wheels/` directory.
     *   Install the built wheels using `uv`.
+    *   Install `float8_experimental` from GitHub.
     *   Install the `llm` project itself in editable mode.
 
 3.  **Activate Environment:**
@@ -156,7 +157,8 @@ After the script completes successfully, your environment will have the core dep
     ```bash
     # Activate environment: source .venv/bin/activate
     # Install PyTorch (example for CUDA 12.1):
-    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    # Note: For FP8 support, use a recent nightly build or PyTorch >= 2.2
+    uv pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
     # Install base package (handle flash-attn/triton build errors if they occur):
     uv pip install --no-build-isolation -e .
     ```
