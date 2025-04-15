@@ -64,22 +64,6 @@ For detailed installation instructions, including **building dependencies from s
     ./scripts/train.sh --config configs/config.yaml --gpus-per-node 8
     ```
 
-## Project Structure
-
-```
-llm/                      # Main package (models, training, data, config, utils)
-scripts/                  # Entry point scripts (train, eval, analyze, ablations)
-configs/                  # Configuration files (main config, datasets)
-tests/                    # Test suite
-docs/                     # Detailed documentation
-├── ARCHITECTURE.md
-├── INSTALLATION.md
-├── CONFIGURATION.md
-├── ANALYSIS.md
-├── EXPERT_MONITORING.md
-└── ABLATION_TESTING.md
-```
-
 ## Further Documentation
 
 -   [Architecture Details (PEER & MLA)](docs/ARCHITECTURE.md)
