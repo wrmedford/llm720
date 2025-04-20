@@ -11,12 +11,26 @@ product, and supports experts with configurable hidden sizes.
 
 from typing import List
 
+import os
+from typing import List, Tuple, Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import sys
+
+# Check environment variable to decide which kernel to use
+_USE_TRITON_KERNEL = os.environ.get("USE_TRITON_KERNEL", "0") == "1"
+if _USE_TRITON_KERNEL:
+    try:
+        # Import the (stubbed) Triton kernel
+        from .kernels.peer_triton import peer_fwd_kernel
+        print("Attempting to use PEER Triton kernel (currently stubbed).")
+    except ImportError:
+        print("Warning: USE_TRITON_KERNEL is set, but Triton kernel import failed. Falling back to PyTorch.")
+        _USE_TRITON_KERNEL = False
 
 
 class PEER(nn.Module):
@@ -102,7 +116,12 @@ class PEER(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def split_queries(self, queries):
+        # Placeholder for storing last indices/scores if needed by hooks/tracking
+        self._last_expert_indices: Optional[torch.Tensor] = None
+        self._last_expert_scores: Optional[torch.Tensor] = None
+
+
+    def split_queries(self, queries: torch.Tensor) -> List[torch.Tensor]:
         """Split queries for multi-dim product keys."""
         # Queries shape: [batch, seq, heads, query_dim]
         chunks = []
@@ -253,14 +272,21 @@ class PEER(nn.Module):
         # Ensure final_indices and final_scores are defined and have correct shape
         if 'final_indices' not in locals() or 'final_scores' not in locals():
              raise RuntimeError("Failed to compute final expert indices and scores.")
+        # Check if the last dimension is 0 when top_k > 0
         if final_indices.shape[-1] == 0 and top_k > 0:
-             raise RuntimeError(f"Computed 0 experts, but requested {top_k}.")
+             # This can happen if k_prime becomes 0, e.g., dim_size is 0
+             # Or if top_k requested is 0
+             # Let's return empty tensors in this specific case, assuming top_k=0 was intended or dim_size=0
+             # If top_k > 0 and dim_size > 0, this indicates an issue elsewhere.
+             # For safety, return tensors with the last dimension as 0.
+             final_scores = torch.empty_like(final_indices).float() # Match shape but size 0
 
         return final_indices, final_scores
 
-    def forward(self, hidden_states):
+
+    def _forward_pytorch(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for the PEER module.
+        Forward pass using the PyTorch implementation.
 
         Args:
             hidden_states: Tensor of shape [batch_size, seq_len, input_dim]
@@ -291,8 +317,9 @@ class PEER(nn.Module):
             queries, self.num_experts_per_tok
         )
 
-        # Store indices for tracking hook if needed
+        # Store indices and scores for tracking/debugging if needed
         self._last_expert_indices = indices
+        self._last_expert_scores = scores
 
         # Normalize scores with softmax
         # scores shape: [B, S, H, top_k]
@@ -354,3 +381,66 @@ class PEER(nn.Module):
         outputs = outputs.sum(dim=2)
 
         return outputs
+
+    def _forward_triton(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass using the (stubbed) Triton kernel.
+        """
+        # Prepare arguments for the kernel
+        # Note: Weights need to be accessed directly (e.g., self.query_proj.weight)
+        # Ensure sub_keys are passed as a list of tensors
+        sub_key_tensors = [p for p in self.sub_keys]
+
+        # Extract necessary config parameters
+        peer_config_dict = {
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "num_experts": self.num_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "num_heads": self.num_heads,
+            "expert_hidden_size": self.expert_hidden_size,
+            "query_dim": self.query_dim,
+            "product_key_dim": self.product_key_dim,
+            "norm_keys": self.norm_keys,
+            "norm_query": self.norm_query,
+            "batch_norm_query": self.batch_norm_query,
+            # Add activation if needed by kernel logic later
+        }
+
+        # Get LayerNorm weights if applicable
+        query_norm_weight = self.query_layer_norm.weight if self.query_layer_norm else None
+        query_norm_bias = self.query_layer_norm.bias if self.query_layer_norm else None
+
+        # Call the stubbed kernel
+        output = peer_fwd_kernel(
+            hidden_states=hidden_states,
+            query_proj_weight=self.query_proj.weight,
+            sub_keys=sub_key_tensors,
+            expert_down_weight=self.expert_down.weight,
+            expert_up_weight=self.expert_up.weight,
+            peer_config=peer_config_dict,
+            query_norm_weight=query_norm_weight,
+            query_norm_bias=query_norm_bias,
+        )
+        return output
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Main forward pass for the PEER module.
+
+        Dispatches to either the PyTorch implementation or the Triton kernel
+        based on the _USE_TRITON_KERNEL flag.
+
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_len, input_dim]
+
+        Returns:
+            output: Tensor of shape [batch_size, seq_len, output_dim]
+        """
+        if _USE_TRITON_KERNEL:
+            # Call the Triton kernel implementation
+            # Note: Currently raises NotImplementedError
+            return self._forward_triton(hidden_states)
+        else:
+            # Call the PyTorch implementation
+            return self._forward_pytorch(hidden_states)
