@@ -104,9 +104,19 @@ dataset_config:
       split: "train"                      # Dataset split to use
       streaming: true                     # Load data progressively (recommended for large datasets)
       weight: 0.7                         # Sampling weight for interleaving
-      # --- Text Extraction (Choose ONE) ---
-      text_field: "text"                  # Field containing the raw text
-      # text_template: "Instruction:\n{instruction}\n\nInput:\n{input}\n\nOutput:\n{output}" # OR: Format string using fields from the dataset
+      # --- Text Extraction (Specify ONE, or leave blank for auto-detection) ---
+      # Option 1: Use a format string with fields from the dataset
+      # text_template: "Instruction:\n{instruction}\n\nInput:\n{input}\n\nOutput:\n{output}"
+      # Option 2: Specify the single field containing the raw text
+      text_field: "text"
+      # Option 3: Specify a preprocessing function to apply to a single field's content
+      # preprocessing_function_name: "format_reasoning" # Name matching a key in PREPROCESSING_FUNCTIONS in datasets.py
+      # text_field: "raw_data"                         # The field to apply the processor to (required if using preprocessing)
+      # --- Priority Order ---
+      # 1. If 'preprocessing_function_name' is set, it's applied to 'text_field', and the result becomes the final 'text'.
+      # 2. Else if 'text_template' is set, it's used to format fields into 'text'.
+      # 3. Else if 'text_field' is set, its content is used as 'text'.
+      # 4. Otherwise, auto-detection is attempted using common field names ('text', 'content', etc.).
 
     - name: "c4"
       path: "allenai/c4"
