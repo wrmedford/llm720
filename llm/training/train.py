@@ -22,6 +22,7 @@ import torch.compiler # Import the compiler module
 import torch.nn as nn
 import torch.optim as optim
 import yaml
+import tiktoken # Import tiktoken
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
@@ -29,7 +30,7 @@ from safetensors.torch import load_file, save_file
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-from transformers import (AutoTokenizer, DataCollatorForLanguageModeling,
+from transformers import (DataCollatorForLanguageModeling, # Removed AutoTokenizer
                           get_scheduler)
 # Use torchao for float8 support
 from torchao.float8 import ( # Updated import
@@ -48,7 +49,7 @@ logger = get_logger(__name__)
 
 # Constants
 MAX_SEQ_LEN = 2048
-PAD_TOKEN_ID = 0
+# PAD_TOKEN_ID = 0 # No longer used directly, will use tiktoken's EOT
 
 
 class TrainerConfig:
@@ -127,7 +128,7 @@ class TrainerConfig:
                     "text_field": "text",
                 },
             ],
-            "tokenizer_name": "gpt2",
+            "tokenizer_name": "o200k_base", # Default to o200k_base
             "max_seq_length": MAX_SEQ_LEN,
         }
 
@@ -179,7 +180,7 @@ class TrainerConfig:
 
 
 def prepare_model_inputs(batch, device):
-    """Prepare model inputs from a batch."""
+    """Prepare model inputs from a batch, ensuring tensors are on the correct device."""
     # Move all tensors to the device
     batch = {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
 
@@ -292,10 +293,13 @@ class ModelEvaluator:
 
     def __init__(self, registry_path, tokenizer, device):
         self.registry = None
-        self.tokenizer = tokenizer
+        # Store the tiktoken encoder instance
+        self.tokenizer: tiktoken.Encoding = tokenizer
         self.device = device
         self.evals_available = False
         self.openai_key_present = bool(os.environ.get("OPENAI_API_KEY"))
+        # Define EOS/PAD token ID for tiktoken
+        self.eot_token_id = self.tokenizer.eot_token
 
         if not self.openai_key_present:
             logger.warning(
@@ -329,8 +333,9 @@ class ModelEvaluator:
         temperature = kwargs.pop("temperature", 0.7)
         top_p = kwargs.pop("top_p", 0.9)
 
-        # Tokenize the prompt
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        # Tokenize the prompt using tiktoken
+        prompt_ids = self.tokenizer.encode(prompt, allowed_special="all") # Allow all special tokens
+        inputs = {"input_ids": torch.tensor([prompt_ids], dtype=torch.long, device=self.device)}
 
         # Generate response
         with torch.no_grad():
@@ -340,15 +345,18 @@ class ModelEvaluator:
                 do_sample=temperature > 0,
                 temperature=temperature,
                 top_p=top_p,
-                pad_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.eot_token_id, # Use EOT token for padding during generation
+                eos_token_id=self.eot_token_id, # Use EOT token for stopping generation
                 **kwargs,
             )
 
         # Decode the response, removing the prompt
-        prompt_length = len(inputs.input_ids[0])
-        response = self.tokenizer.decode(
-            outputs[0][prompt_length:], skip_special_tokens=True
-        )
+        prompt_length = len(inputs["input_ids"][0])
+        # outputs[0] contains the full sequence including prompt
+        output_ids = outputs[0][prompt_length:].tolist()
+        # Filter out potential padding tokens if necessary, though EOS should stop generation
+        output_ids = [token_id for token_id in output_ids if token_id != self.eot_token_id]
+        response = self.tokenizer.decode(output_ids)
 
         return [{"text": response}]
 
@@ -486,15 +494,38 @@ def run_training(config: TrainerConfig):
         # Save configuration to output directory
         config.save(os.path.join(config.train_config["output_dir"], "config.yaml"))
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.dataset_config["tokenizer_name"])
-
-    # Ensure tokenizer has padding token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Load tiktoken encoder
+    tokenizer_name = config.dataset_config["tokenizer_name"]
+    logger.info(f"Loading tiktoken encoder: {tokenizer_name}")
+    try:
+        tokenizer = tiktoken.get_encoding(tokenizer_name)
+        # Define pad_token_id using the EOT token
+        pad_token_id = tokenizer.eot_token
+        logger.info(f"Using Tokenizer: {tokenizer_name}, Vocab Size: {tokenizer.n_vocab}, EOT/PAD ID: {pad_token_id}")
+    except ValueError as e:
+        logger.error(f"Failed to load tiktoken encoder '{tokenizer_name}': {e}")
+        raise
 
     # Create model
     logger.info("Initializing model...")
+    # Verify configured vocab_size is sufficient for the tokenizer
+    configured_vocab_size = config.model_config.get("vocab_size")
+    actual_vocab_size = tokenizer.n_vocab
+    if configured_vocab_size is None:
+        logger.warning(f"vocab_size not found in model_config. Setting to tokenizer's vocab size: {actual_vocab_size}")
+        config.model_config["vocab_size"] = actual_vocab_size
+    elif configured_vocab_size < actual_vocab_size:
+        logger.warning(
+            f"Configured vocab_size ({configured_vocab_size}) is smaller than tokenizer vocab size ({actual_vocab_size}). "
+            f"Increasing model vocab_size to {actual_vocab_size}."
+        )
+        config.model_config["vocab_size"] = actual_vocab_size
+    else:
+        logger.info(f"Using configured vocab_size: {configured_vocab_size} (Tokenizer actual: {actual_vocab_size})")
+        # Ensure the value is an int
+        config.model_config["vocab_size"] = int(configured_vocab_size)
+
+
     tf_config = TransformerConfig(**config.model_config)
     model = create_model_from_config(tf_config)
 
@@ -544,11 +575,15 @@ def run_training(config: TrainerConfig):
     logger.info("Preparing datasets...")
     train_dataset = prepare_datasets(config.dataset_config)
 
-    # Tokenize datasets
-    def tokenize_map_fn(examples):
-        return tokenize_function(
-            examples, tokenizer, config.dataset_config["max_seq_length"]
-        )
+    # Tokenize datasets using tiktoken
+    # We need to pass the tokenizer and pad_token_id to the map function
+    from functools import partial
+    tokenize_map_fn = partial(
+        tokenize_function,
+        tokenizer=tokenizer,
+        max_seq_length=config.dataset_config["max_seq_length"],
+        pad_token_id=pad_token_id
+    )
 
     tokenized_dataset = train_dataset.map(
         tokenize_map_fn,
@@ -557,10 +592,18 @@ def run_training(config: TrainerConfig):
     )
 
     # Create data loader
+    # DataCollatorForLanguageModeling expects a HF tokenizer or specific dict structure.
+    # Since our tokenize_function now prepares 'input_ids' and 'attention_mask' correctly
+    # and handles padding, we can use a simpler default collator or pass pad_token_id.
+    # Let's try passing pad_token_id directly.
+    # Note: Label shifting for causal LM is handled inside the model's forward pass.
     data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
+        tokenizer=None, # Pass None as we handle tokenization separately
         mlm=False,
+        pad_to_multiple_of=config.dataset_config["max_seq_length"] # Ensure batches have consistent length
     )
+    # Manually set the pad_token_id if the collator needs it (though it might not use it if tokenizer=None)
+    # data_collator.tokenizer = argparse.Namespace(pad_token_id=pad_token_id) # Create a dummy tokenizer object
 
     # Determine appropriate number of workers
     # Use half the available CPUs per process as a starting point, minimum 1

@@ -10,10 +10,13 @@ for language model training.
 
 import logging
 import os
+import logging
+import os
 from typing import Dict, List
 
+import tiktoken # Import tiktoken
 from datasets import IterableDataset, interleave_datasets, load_dataset
-from transformers import PreTrainedTokenizerBase
+# from transformers import PreTrainedTokenizerBase # No longer needed
 
 
 def interleave_datasets_with_weights(
@@ -197,41 +200,47 @@ def prepare_datasets(config: Dict) -> IterableDataset:
 
 
 def tokenize_function(
-    examples, tokenizer: PreTrainedTokenizerBase, max_seq_length: int
+    examples, tokenizer: tiktoken.Encoding, max_seq_length: int, pad_token_id: int
 ):
     """
-    Tokenize function for dataset processing.
+    Tokenize function for dataset processing using tiktoken.
 
     Args:
-        examples: The examples to tokenize
-        tokenizer: The tokenizer to use
+        examples: The examples to tokenize (dictionary with 'text' key)
+        tokenizer: The tiktoken encoder instance
         max_seq_length: Maximum sequence length
+        pad_token_id: The token ID to use for padding
 
     Returns:
-        Tokenized examples
+        Tokenized examples with 'input_ids' and 'attention_mask'
     """
-    # Tokenize the texts
-    tokenized = tokenizer(
-        examples["text"],
-        truncation=True,
-        max_length=max_seq_length,
-        return_overflowing_tokens=True,
-        return_length=True,
-    )
-
-    # Create input_ids of exactly max_seq_length size for each example
     result = {"input_ids": [], "attention_mask": []}
+    texts = examples["text"]
 
-    for input_ids, attention_mask in zip(
-        tokenized["input_ids"], tokenized["attention_mask"]
-    ):
-        # If shorter than max_length, pad
-        if len(input_ids) < max_seq_length:
-            padding_length = max_seq_length - len(input_ids)
-            input_ids = input_ids + [tokenizer.pad_token_id] * padding_length
-            attention_mask = attention_mask + [0] * padding_length
+    # Ensure texts is a list
+    if isinstance(texts, str):
+        texts = [texts]
 
-        result["input_ids"].append(input_ids)
+    for text in texts:
+        if not isinstance(text, str):
+            # Handle potential non-string data (e.g., None)
+            text = "" # Replace with empty string
+
+        # Encode using tiktoken, allow endoftext special token
+        # Note: tiktoken doesn't handle truncation directly in encode
+        token_ids = tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+
+        # Truncate
+        truncated_ids = token_ids[:max_seq_length]
+
+        # Pad
+        padding_length = max_seq_length - len(truncated_ids)
+        padded_ids = truncated_ids + [pad_token_id] * padding_length
+
+        # Create attention mask
+        attention_mask = [1] * len(truncated_ids) + [0] * padding_length
+
+        result["input_ids"].append(padded_ids)
         result["attention_mask"].append(attention_mask)
 
     return result

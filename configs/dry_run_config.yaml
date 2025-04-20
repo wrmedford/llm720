@@ -6,7 +6,7 @@ model_config:
   num_hidden_layers: 2
   num_attention_heads: 4
   intermediate_size: 256
-  vocab_size: 50272 # Padded vocab size (divisible by 16) for FP8 compatibility
+  vocab_size: 200064 # Padded vocab size for o200k_base (divisible by 64)
 
   # PEER configuration (Simplified)
   use_peer: true
@@ -63,7 +63,7 @@ dataset_config:
       streaming: false # Disable streaming for small dataset
       weight: 1.0
       text_field: "text"
-  tokenizer_name: "gpt2" # Keep tokenizer consistent
+  tokenizer_name: "o200k_base" # Changed tokenizer name
   max_seq_length: 256 # Shorter sequence length
 
 eval_config:

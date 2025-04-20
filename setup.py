@@ -27,6 +27,7 @@ setup(
         "flash-attn>=2.0.0; platform_system=='Linux'", # flash-attn is often Linux-only
         "torchao>=0.10.0", # Use torchao for FP8 and other optimizations
         "pynvml>=11.0.0",  # For GPU monitoring
+        "tiktoken>=0.7.0", # Added tiktoken dependency
     ],
     extras_require={
         "dev": [
