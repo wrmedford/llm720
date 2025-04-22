@@ -64,6 +64,10 @@ For detailed installation instructions, including **building dependencies from s
     ./scripts/train.sh --config configs/config.yaml --gpus-per-node 8
     ```
 
+## Join us on Discord
+
+[![](https://dcbadge.limes.pink/api/server/https://discord.gg/5DgUmSB2uP)](https://discord.gg/https://discord.gg/5DgUmSB2uP)
+
 ## Further Documentation
 
 -   [Architecture Details (PEER & MLA)](docs/ARCHITECTURE.md)
