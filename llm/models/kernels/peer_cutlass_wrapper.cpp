@@ -159,6 +159,8 @@ torch::Tensor peer_forward(
         key_weight_1.data_ptr<at::Half>(),
         key_weight_2.data_ptr<at::Half>(),
         output.data_ptr<at::Half>(),
+        ln_weight.numel() > 0 ? ln_weight.data_ptr<at::Half>() : nullptr,
+        ln_bias.numel() > 0 ? ln_bias.data_ptr<at::Half>() : nullptr,
         batch_size,
         seq_len,
         static_cast<float>(dropout_rate),

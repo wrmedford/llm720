@@ -1162,6 +1162,8 @@ public:
         const half* sub_keys1,
         const half* sub_keys2,
         half* output,
+        const half* ln_scale,  // Layer norm scale/weight
+        const half* ln_bias,   // Layer norm bias
         int batch_size,
         int seq_len,
         float dropout_rate = 0.0f,
@@ -1181,8 +1183,38 @@ public:
         int grid_size = (num_tokens + chunk_size - 1) / chunk_size;
         grid_size = min(grid_size, 256);  // Limit grid size
         
+        // Use JIT-defined parameters or defaults
+        #ifdef PEER_JIT_TOP_K
+            constexpr int TopK = PEER_JIT_TOP_K;
+        #else
+            constexpr int TopK = 16;
+        #endif
+        
+        #ifdef PEER_JIT_NUM_HEADS
+            constexpr int NumHeads = PEER_JIT_NUM_HEADS;
+        #else
+            constexpr int NumHeads = 8;
+        #endif
+        
+        #ifdef PEER_JIT_QUERY_DIM
+            constexpr int QueryDim = PEER_JIT_QUERY_DIM;
+        #else
+            constexpr int QueryDim = 256;
+        #endif
+        
+        #ifdef PEER_JIT_SQRT_N
+            constexpr int SqrtN = PEER_JIT_SQRT_N;
+        #else
+            constexpr int SqrtN = 1024;
+        #endif
+        
+        #ifdef PEER_JIT_OUTPUT_DIM
+            constexpr int OUT = PEER_JIT_OUTPUT_DIM;
+        #else
+            constexpr int OUT = 1024;
+        #endif
+        
         // Calculate shared memory with proper padding
-        constexpr int TopK = 16;
         size_t smem_size = 0;
         smem_size += align_to<64>(chunk_size * input_dim_ * sizeof(half));  // Token cache
         smem_size += 2 * align_to<64>(input_dim_ * Config::HiddenSize * sizeof(half));  // U buffers
@@ -1191,7 +1223,7 @@ public:
         smem_size += align_to<64>(Config::HiddenSize * sizeof(half));  // Hidden activations (FP16)
         
         // Set shared memory configuration
-        auto kernel_func = peer_kernel_enhanced<Config, half, 8, TopK, 256, 1024, 1024, BLOCK_DIM>;
+        auto kernel_func = peer_kernel_enhanced<Config, half, NumHeads, TopK, QueryDim, SqrtN, OUT, BLOCK_DIM>;
         set_smem_config((void*)kernel_func, smem_size);
         
         // No need to memset - kernel directly writes output
@@ -1201,7 +1233,7 @@ public:
             input, query_weight, query_bias,
             sub_keys1, sub_keys2, output,
             cache_->get_device_experts(),  // Device-only mirror
-            nullptr, nullptr,  // bn_scale, bn_bias
+            ln_scale, ln_bias,  // Layer norm parameters
             batch_size, seq_len, input_dim_,
             chunk_size,  // Runtime parameter
             dropout_rate_,
