@@ -6,10 +6,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
 
-// Forward declaration of the CUTLASS implementation
-namespace peer {
-    class PEEROperatorEnhanced;
-}
+// Include the CUTLASS implementation header
+#include "peer_cutlass.h"
 
 // Global operator instance (initialized on first use)
 static std::unique_ptr<peer::PEEROperatorEnhanced> g_peer_op;
@@ -111,15 +109,21 @@ torch::Tensor peer_forward(
     );
     
     // Copy expert weights to the operator's memory
-    // In production, this would be loaded from checkpoint once
+    // This is done once per forward pass to ensure weights are synchronized
     {
         static bool weights_initialized = false;
         static std::mutex weight_init_mutex;
         std::lock_guard<std::mutex> lock(weight_init_mutex);
         
         if (!weights_initialized) {
-            // For now, we'll use the provided weights directly
-            // In production, copy them to the hierarchical cache
+            // First allocate the internal buffers
+            g_peer_op->allocate_weights();
+            
+            // Then copy PyTorch-managed weights to CUTLASS internal buffers
+            g_peer_op->copy_weights_from_torch(
+                expert_weights_u.data_ptr<at::Half>(),
+                expert_weights_v.data_ptr<at::Half>()
+            );
             weights_initialized = true;
         }
     }

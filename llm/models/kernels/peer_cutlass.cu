@@ -28,6 +28,8 @@
 #include <chrono>
 #include <mutex>
 
+#include "peer_cutlass.h"
+
 namespace peer {
 
 using namespace cute;
@@ -1084,6 +1086,24 @@ public:
         printf("Allocated %.2f GB of expert weights in %s memory\n",
                double(u_size + v_size) / (1024.0 * 1024.0 * 1024.0),
                use_managed_memory_ ? "managed" : "pinned");
+    }
+    
+    // Copy weights from PyTorch tensors to internal buffers
+    void copy_weights_from_torch(const half* torch_u_weights, const half* torch_v_weights) {
+        __uint128_t u_size = __uint128_t(num_experts_) * input_dim_ * expert_hidden_size_ * sizeof(half);
+        __uint128_t v_size = __uint128_t(num_experts_) * expert_hidden_size_ * output_dim_ * sizeof(half);
+        
+        // Copy from PyTorch tensors to our allocated memory
+        memcpy(u_weights_, torch_u_weights, u_size);
+        memcpy(v_weights_, torch_v_weights, v_size);
+        
+        // If using managed memory, prefetch to GPU for better performance
+        if (use_managed_memory_) {
+            int device;
+            cudaGetDevice(&device);
+            cudaMemPrefetchAsync(u_weights_, u_size, device);
+            cudaMemPrefetchAsync(v_weights_, v_size, device);
+        }
     }
     
     void forward(
