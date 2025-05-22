@@ -1,5 +1,3 @@
-How's this? 
-
 // peer_cutlass_enhanced_production.cu
 // Production-ready PEER implementation with all correctness fixes
 
