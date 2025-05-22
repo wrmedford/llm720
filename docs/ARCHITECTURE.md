@@ -1,51 +1,59 @@
-# Architecture Details
+# Architecture Overview
 
-This project implements two core architectural innovations inspired by recent research from DeepSeek (e.g., DeepSeek-V2/V3, Mixture-of-A-Million-Experts):
-
-1.  **Parameter Efficient Expert Retrieval (PEER):** An advanced Mixture-of-Experts (MoE) layer designed to scale to millions of tiny experts (often single neurons). Instead of traditional routing, PEER uses efficient "product key" retrieval to select a small subset of these experts for each token. This allows for a massive total parameter count while keeping the activated parameters per token low, aiming for high performance with reduced computational cost.
-2.  **Multi-Headed Latent Attention (MLA):** An efficient attention mechanism based on the DeepSeek V3 architecture. It employs techniques like low-rank projections and RoPE/NoPE decomposition to optimize attention computation, particularly for inference, and integrates with optimized kernels like FlashAttention.
-
-The goal is to build powerful LLMs that are efficient to train and run, leveraging sparse activation of a vast number of parameters.
+This document describes the architectural components of the foundation language model, including PEER (Parameter Efficient Expert Retrieval) and MLA (Multi-head Latent Attention).
 
 ## PEER (Parameter Efficient Expert Retrieval)
 
-PEER uses product keys to efficiently select experts from a large pool.
+PEER implements a highly scalable Mixture-of-Experts architecture that can efficiently handle millions of tiny experts. The key innovation is the use of product keys for O(sqrt(N)) expert selection complexity.
 
-**Key Concepts:**
+### Key Features
 
--   **Product Keys:** Instead of a single large key space, PEER uses a Cartesian product of smaller sub-key spaces. An expert's key is formed by combining sub-keys from each dimension.
--   **Efficient Retrieval:** Queries are also split into sub-queries. Scores are computed independently within each dimension for the sub-queries against the sub-keys. An optimized combination strategy (avoiding full N-expert scoring) is used to find the top-k overall experts based on the combined sub-scores.
--   **Tiny Experts:** PEER is designed to work effectively with a very large number of simple experts, often just single neurons or small MLPs.
+- **Product Key Routing**: Decomposes expert selection into multiple smaller searches
+- **Tiny Experts**: Each expert has minimal parameters (default hidden_size=1)
+- **Multi-head Design**: Separate expert pools per attention head
+- **Flexible Activation**: Supports variable top-k expert selection
 
-**Configuration:**
+### Implementation Variants
 
-See `llm/models/experts.py` and the [Configuration Guide](CONFIGURATION.md) for details on parameters like:
+1. **PyTorch Implementation**: Reference implementation with full flexibility
+2. **CUTLASS Kernel**: Optimized CUDA kernel for H100/A100 GPUs (see [CUTLASS Kernel Documentation](CUTLASS_KERNEL.md))
+3. **Triton Kernel**: Planned implementation (currently stubbed)
 
--   `num_experts`: Total number of experts (must equal the product of `product_key_dim` sizes).
--   `product_key_dim`: List defining the size of each sub-key dimension (e.g., `[1024, 1024]` for 1M experts in 2D).
--   `num_experts_per_tok`: Number of experts to activate for each token.
--   `num_heads`: Number of independent retrieval heads.
--   `expert_hidden_size`: Size of the hidden layer within each expert MLP (can be 1).
--   `query_dim`: Dimension of the query vector used for retrieval.
+## MLA (Multi-head Latent Attention)
 
-## MLA (Multi-Headed Latent Attention)
+MLA provides an efficient attention mechanism based on the DeepSeek V3 architecture, using low-rank projections and RoPE/NoPE decomposition.
 
-MLA is an attention mechanism inspired by DeepSeek V3.
+### Key Features
 
-**Key Concepts:**
+- **Low-rank Key-Value Projection**: Reduces memory and computation
+- **RoPE Integration**: Rotary position embeddings for better position modeling
+- **Shared Key-Value Heads**: Parameter efficiency through head sharing
 
--   **Low-Rank Projections:** Key and Value states are often projected down to a lower-rank latent space (`kv_lora_rank`) before attention computation, reducing computational cost.
--   **RoPE/NoPE Decomposition:** Query and Key vectors are split into parts handled by Rotary Positional Embeddings (RoPE) and parts without positional encoding (NoPE).
--   **Separate Projections:** Distinct linear projections are used for Query, Key, and Value.
--   **Optimized Kernels:** Designed to leverage kernels like FlashAttention for performance. The implementation includes fallbacks to PyTorch's `scaled_dot_product_attention`.
--   **Decode Path Optimization:** Pre-computes certain weight transformations (`W_UK_T`, `W_UV`) to accelerate the attention calculation during single-token decoding steps.
+## Memory Hierarchy
 
-**Configuration:**
+The system implements a sophisticated memory hierarchy for expert weights:
 
-See `llm/models/attention.py` and the [Configuration Guide](CONFIGURATION.md) for details on parameters like:
+1. **L1/Shared Memory**: Active tokens and current experts
+2. **L2 Cache**: Token chunks optimized for 40MB L2 on H100
+3. **HBM**: Hot expert cache (configurable size)
+4. **System RAM**: Full expert storage with UVA access
 
--   `q_lora_rank`: Rank for the optional query LoRA projection.
--   `kv_lora_rank`: Rank for the key-value latent projection.
--   `qk_rope_head_dim`: Dimension of the query/key part processed by RoPE.
--   `v_head_dim`: Dimension of the value head.
--   `qk_nope_head_dim`: Dimension of the query/key part *not* processed by RoPE.
+For detailed memory management strategies, see [Memory Hierarchy Documentation](MEMORY_HIERARCHY.md).
+
+## Integration
+
+The foundation model combines PEER and MLA layers in a transformer architecture:
+
+```python
+class FoundationModel(nn.Module):
+    def __init__(self, config):
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                attention=MLA(config),
+                ffn=PEER(config) if use_peer else FFN(config)
+            )
+            for _ in range(config.num_layers)
+        ])
+```
+
+This architecture enables efficient scaling to billions of parameters while maintaining reasonable activation costs.

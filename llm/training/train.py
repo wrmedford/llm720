@@ -36,8 +36,10 @@ from transformers import (DataCollatorForLanguageModeling, # Removed AutoTokeniz
 from torchao.float8 import ( # Updated import
     convert_to_float8_training,
     Float8LinearConfig,
+    ScalingType,
+    ScalingGranularity,
     # Optional: Import other config elements if needed later
-    # ScalingType, ScalingGranularity, CastConfig, Float8GemmConfig
+    # CastConfig, Float8GemmConfig
 )
 # from torchao.utils import TORCH_VERSION_AT_LEAST_2_5 # Optional: Add version check if needed
 
@@ -525,24 +527,34 @@ def run_training(config: TrainerConfig):
         # Ensure the value is an int
         config.model_config["vocab_size"] = int(configured_vocab_size)
 
-
-    tf_config = TransformerConfig(**config.model_config)
-    model = create_model_from_config(tf_config)
-
-    # Convert model to use Float8 for training using torchao
-    # Ensure model is on the correct device and dtype (e.g., bf16) before conversion
-    # Note: The conversion should happen *before* accelerator.prepare or torch.compile
-    # Determine target dtype (bf16 preferred for H100+)
+    # Determine target primary dtype (bf16 preferred for H100+)
     fp8_dtype = torch.bfloat16 if config.train_config.get("bf16", torch.cuda.is_bf16_supported()) else torch.float16
-    model = model.to(accelerator.device).to(fp8_dtype) # Move and cast before conversion
 
-    logger.info(f"Converting model to use Float8 with dtype {fp8_dtype}...")
-    # Re-enable padding to handle dimensions not divisible by 16 (like vocab size)
-    fp8_config = Float8LinearConfig(pad_inner_dim=True)
-    logger.info(f"Using Float8LinearConfig with padding: {fp8_config}")
+    # Create model directly on target device and primary dtype
+    logger.info(f"Initializing model on {accelerator.device} with primary dtype {fp8_dtype}...")
+    tf_config = TransformerConfig(**config.model_config)
+    # Initialize model on the target device and dtype.
+    # The modified _init_weights method will be applied during creation,
+    # setting LayerNorm/Linear biases to FP32 within this BF16/FP16 structure.
+    model = create_model_from_config(tf_config).to(device=accelerator.device, dtype=fp8_dtype)
+    logger.info("Model initialized with mixed precision (FP32 for LN/Bias).")
+
+    # Convert Linear/Embedding weights to Float8 format
+    logger.info(f"Converting model Linear/Embedding weights to Float8 format...")
+    # Configure FP8 conversion explicitly:
+    # - Use DELAYED scaling for stability.
+    # - Use PER_TENSOR granularity (robust default).
+    # - Enable padding for dimensions not divisible by 16 (e.g., vocab size).
+    # - torchao's default uses HYBRID format (E4M3 weights, E5M2 activations).
+    fp8_config = Float8LinearConfig(
+        scaling_type_weights=ScalingType.DELAYED,
+        scaling_type_activation=ScalingType.DELAYED,
+        scaling_granularity=ScalingGranularity.PER_TENSOR,
+        pad_inner_dim=True,
+    )
+    logger.info(f"Using explicit Float8LinearConfig: {fp8_config}")
     convert_to_float8_training(model, config=fp8_config) # Pass the config
-    logger.info("Model converted for Float8 training with padding.")
-
+    logger.info("Model Linear/Embedding weights converted for Float8 training.")
 
     # Set up expert usage tracking if enabled
     expert_tracker = None
@@ -626,7 +638,21 @@ def run_training(config: TrainerConfig):
     model, optimizer, train_dataloader, scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, scheduler
     )
-    
+
+    # --- Ensure LayerNorm is FP32 ---
+    # After accelerator.prepare and before torch.compile, explicitly set LayerNorm
+    # modules to FP32, as torchao's FP8 conversion focuses on Linear/Embedding weights
+    # and accelerator might have cast the model to BF16/FP16.
+    logger.info("Ensuring LayerNorm modules are set to FP32...")
+    for name, module in accelerator.unwrap_model(model).named_modules():
+        if isinstance(module, nn.LayerNorm):
+            module.to(torch.float32)
+            # Log parameters to confirm dtype
+            # for param_name, param in module.named_parameters():
+            #     logger.debug(f"LayerNorm {name}.{param_name} set to {param.dtype}")
+    logger.info("LayerNorm modules confirmed as FP32.")
+    # --- End LayerNorm FP32 ---
+
     # Compile model for better performance
     logger.info("Compiling model with torch.compile...")
     model = torch.compile(model, mode="reduce-overhead")
