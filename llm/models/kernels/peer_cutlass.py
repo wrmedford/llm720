@@ -203,6 +203,9 @@ def peer_forward_cutlass(
         ln_weight = ln_weight.contiguous().half()
         ln_bias = ln_bias.contiguous().half() if ln_bias is not None else None
     
+    # Create an output tensor to be filled by the kernel
+    output_tensor = torch.empty(batch_size, seq_len, output_dim, dtype=x.dtype, device=x.device)
+    
     # Call CUTLASS kernel with JIT compiled module
     output = kernel_module.peer_forward(
         x,
@@ -212,6 +215,7 @@ def peer_forward_cutlass(
         key_weight_2,
         expert_weights_u,
         expert_weights_v,
+        output_tensor,  # Pass the pre-allocated output tensor here
         ln_weight if layer_norm and ln_weight is not None else torch.empty(0, dtype=torch.half, device=x.device),
         ln_bias if layer_norm and ln_bias is not None else torch.empty(0, dtype=torch.half, device=x.device),
         batch_size,
