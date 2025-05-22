@@ -1137,7 +1137,7 @@ public:
         smem_size += 2 * align_to<64>(input_dim_ * Config::HiddenSize * sizeof(half));  // U buffers
         smem_size += 2 * align_to<64>(Config::HiddenSize * output_dim_ * sizeof(half));  // V buffers
         smem_size += align_to<64>(query_dim_ * sizeof(half));  // Query (FP16)
-        smem_size += TopK * Config::HiddenSize * sizeof(half);  // Hidden activations (FP16)
+        smem_size += align_to<64>(Config::HiddenSize * sizeof(half));  // Hidden activations (FP16)
         
         // Set shared memory configuration
         auto kernel_func = peer_kernel_enhanced<Config, half, 8, TopK, 256, 1024, 1024, BLOCK_DIM>;
