@@ -29,6 +29,9 @@ public:
     // Copy weights from PyTorch tensors to internal buffers
     void copy_weights_from_torch(const __half* torch_u_weights, const __half* torch_v_weights);
     
+    // Direct pointer mode: Use PyTorch tensors directly without copying
+    void set_weight_pointers(const __half* torch_u_weights, const __half* torch_v_weights);
+    
     void forward(
         const __half* input,
         const __half* query_weight,
@@ -38,6 +41,7 @@ public:
         __half* output,
         int batch_size,
         int seq_len,
+        float dropout_rate = 0.0f,
         cudaStream_t stream = 0
     );
     

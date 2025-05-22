@@ -225,6 +225,23 @@ public:
         }
     }
     
+    // Update expert pointers when using PyTorch tensors directly
+    void update_expert_pointers(half* u_weights, half* v_weights) {
+        // Update host-side pointers
+        for (int i = 0; i < experts_.size(); i++) {
+            experts_[i].host_u_ptr = u_weights + i * (expert_u_bytes_ / sizeof(half));
+            experts_[i].host_v_ptr = v_weights + i * (expert_v_bytes_ / sizeof(half));
+            
+            // Update device-side pointer table
+            d_experts_managed_[i].host_u = (const half*)experts_[i].host_u_ptr;
+            d_experts_managed_[i].host_v = (const half*)experts_[i].host_v_ptr;
+        }
+        
+        // Copy updated pointers to device-only mirror
+        cudaMemcpy(d_experts_device_, d_experts_managed_, 
+                   num_experts_ * sizeof(ExpertPtrDev), cudaMemcpyHostToDevice);
+    }
+    
     // Get device-side expert pointer table (use device mirror for perf)
     ExpertPtrDev* get_device_experts() const {
         return d_experts_device_;
@@ -740,6 +757,7 @@ __global__ void peer_kernel_enhanced(
     const Element* __restrict__ bn_bias,
     int B, int S, int IN,
     int chunk_size,  // Runtime parameter
+    float dropout_rate = 0.0f,
     bool use_batch_norm = true,
     bool norm_keys = true,
     bool norm_query = true
@@ -943,6 +961,24 @@ __global__ void peer_kernel_enhanced(
                     }
                     __syncthreads();
                     
+                    // Apply dropout after GELU if dropout_rate > 0
+                    if (dropout_rate > 0.0f) {
+                        // Initialize RNG state per thread (use block + thread + expert for seed variation)
+                        curandState_t state;
+                        curand_init(clock64() + expert_id, tid + blockIdx.x * blockDim.x, 0, &state);
+                        
+                        for (int i = tid; i < Config::HiddenSize; i += blockDim.x) {
+                            float rand_val = curand_uniform(&state);
+                            if (rand_val < dropout_rate) {
+                                hidden_smem[i] = Element(0.0f);
+                            } else {
+                                // Scale by (1 / (1 - dropout_rate)) to maintain expected value
+                                hidden_smem[i] = Element(float(hidden_smem[i]) / (1.0f - dropout_rate));
+                            }
+                        }
+                        __syncthreads();
+                    }
+                    
                     // V * hidden -> output accumulation
                     for (int i = 0; i < OUT_PER_THREAD; i++) {
                         int out_idx = tid * OUT_PER_THREAD + i;
@@ -1007,6 +1043,7 @@ private:
     int sqrt_n_;
     int input_dim_;
     int output_dim_;
+    float dropout_rate_;
     
     // Hierarchical memory cache
     std::unique_ptr<HierarchicalExpertCache> cache_;
@@ -1106,6 +1143,18 @@ public:
         }
     }
     
+    // Direct pointer mode: Use PyTorch tensors directly without copying
+    void set_weight_pointers(const half* torch_u_weights, const half* torch_v_weights) {
+        // Directly use PyTorch-managed memory
+        // WARNING: This bypasses our internal allocation and the caller must ensure
+        // the PyTorch tensors remain valid during kernel execution
+        u_weights_ = const_cast<half*>(torch_u_weights);
+        v_weights_ = const_cast<half*>(torch_v_weights);
+        
+        // Update the cache's expert pointers to use the PyTorch memory
+        cache_->update_expert_pointers(u_weights_, v_weights_);
+    }
+    
     void forward(
         const half* input,
         const half* query_weight,
@@ -1115,8 +1164,10 @@ public:
         half* output,
         int batch_size,
         int seq_len,
+        float dropout_rate = 0.0f,
         cudaStream_t stream = 0
     ) {
+        dropout_rate_ = dropout_rate;  // Store for kernel use
         // Compute chunk size at runtime
         int chunk_size = compute_l2_chunk_size<half>(input_dim_);
         chunk_size = std::min(chunk_size, batch_size * seq_len);
@@ -1153,6 +1204,7 @@ public:
             nullptr, nullptr,  // bn_scale, bn_bias
             batch_size, seq_len, input_dim_,
             chunk_size,  // Runtime parameter
+            dropout_rate_,
             true, true, true
         );
         

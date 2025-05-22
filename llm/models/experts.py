@@ -462,7 +462,7 @@ class PEER(nn.Module):
             num_experts=self.num_experts,
             expert_hidden_size=self.expert_hidden_size,
             top_k=self.num_experts_per_tok,
-            dropout_rate=0.0,  # Can be made configurable
+            dropout_rate=self.dropout.p,
             layer_norm=self.batch_norm_query,
             ln_weight=ln_weight,
             ln_bias=ln_bias,

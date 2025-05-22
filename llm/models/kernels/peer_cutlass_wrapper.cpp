@@ -83,7 +83,8 @@ torch::Tensor peer_forward(
     int64_t top_k,
     bool layer_norm,
     bool norm_keys,
-    bool norm_query
+    bool norm_query,
+    double dropout_rate = 0.0
 ) {
     // Validate inputs
     TORCH_CHECK(x.device().is_cuda(), "Input must be on CUDA device");
@@ -108,23 +109,42 @@ torch::Tensor peer_forward(
         output_dim
     );
     
-    // Copy expert weights to the operator's memory
-    // This is done once per forward pass to ensure weights are synchronized
+    // Handle expert weights synchronization
     {
-        static bool weights_initialized = false;
-        static std::mutex weight_init_mutex;
-        std::lock_guard<std::mutex> lock(weight_init_mutex);
+        static bool initialized = false;
+        static bool use_direct_mode = false;
+        static std::mutex init_mutex;
         
-        if (!weights_initialized) {
-            // First allocate the internal buffers
-            g_peer_op->allocate_weights();
-            
-            // Then copy PyTorch-managed weights to CUTLASS internal buffers
+        if (!initialized) {
+            std::lock_guard<std::mutex> lock(init_mutex);
+            if (!initialized) {
+                // Check if we should use direct pointer mode (no copies)
+                const char* direct_mode_env = std::getenv("PEER_DIRECT_WEIGHT_ACCESS");
+                use_direct_mode = (direct_mode_env && std::string(direct_mode_env) == "1");
+                
+                if (!use_direct_mode) {
+                    // Traditional mode: allocate internal buffers
+                    g_peer_op->allocate_weights();
+                }
+                
+                initialized = true;
+            }
+        }
+        
+        if (use_direct_mode) {
+            // Direct mode: Use PyTorch tensors directly (zero-copy)
+            // This is more efficient but requires PyTorch tensors to remain valid
+            g_peer_op->set_weight_pointers(
+                expert_weights_u.data_ptr<at::Half>(),
+                expert_weights_v.data_ptr<at::Half>()
+            );
+        } else {
+            // Traditional mode: Copy weights on every forward pass
+            // This ensures training updates are reflected but has copy overhead
             g_peer_op->copy_weights_from_torch(
                 expert_weights_u.data_ptr<at::Half>(),
                 expert_weights_v.data_ptr<at::Half>()
             );
-            weights_initialized = true;
         }
     }
     
@@ -141,6 +161,7 @@ torch::Tensor peer_forward(
         output.data_ptr<at::Half>(),
         batch_size,
         seq_len,
+        static_cast<float>(dropout_rate),
         stream
     );
     

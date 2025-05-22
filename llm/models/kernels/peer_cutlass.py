@@ -152,10 +152,7 @@ def peer_forward_cutlass(
         layer_norm,
         True,  # norm_keys
         True,  # norm_query
+        dropout_rate,
     )
-    
-    # Apply dropout if specified
-    if dropout_rate > 0.0 and x.requires_grad:
-        output = torch.nn.functional.dropout(output, p=dropout_rate, training=True)
     
     return output
