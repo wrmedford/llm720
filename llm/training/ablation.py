@@ -416,9 +416,9 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ab
         config["model_config"]["num_hidden_layers"] = model_size["num_hidden_layers"]
         config["model_config"]["intermediate_size"] = model_size["intermediate_size"]
         
-        # Update MLA config to scale with model size
-        config["model_config"]["mla_config"]["q_lora_rank"] = model_size["hidden_size"] // 2
-        config["model_config"]["mla_config"]["kv_lora_rank"] = model_size["hidden_size"] // 2
+        # Update MLA config to scale with model size using DeepSeek V3 ratios
+        config["model_config"]["mla_config"]["q_lora_rank"] = int(model_size["hidden_size"] * 0.214)  # ~1536/7168
+        config["model_config"]["mla_config"]["kv_lora_rank"] = int(model_size["hidden_size"] * 0.071)  # ~512/7168
         
         # Set use_peer based on experiment configuration
         config["model_config"]["use_peer"] = experiment.get("use_peer", True)
@@ -443,6 +443,7 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ab
         else:
             # Dense baseline - explicitly set use_peer to False
             # No need for additional configuration since PEER is disabled
+            pass
             
     elif ablation_type == "granularity_sweep":
         # Ablation 2: Expert-Granularity Sweep
@@ -1238,11 +1239,6 @@ def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
             ax1.set_ylabel('Perplexity')
             ax1.set_title(f'Perplexity vs Activation % ({title_suffix})')
             ax1.grid(True, alpha=0.3)
-            
-            # Calculate actual active params for plotting
-            if 'num_experts' in act_df.columns:
-                act_df['calc_active_params'] = (act_df['activation_percentage'] / 100.0 * 
-                                               act_df['num_experts'] * EXPERT_SIZE_BYTES)
             
             # Perplexity vs active parameters
             if 'active_params' in act_df.columns:
