@@ -417,7 +417,7 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ab
         config["model_config"]["intermediate_size"] = model_size["intermediate_size"]
         
         # Update MLA config to scale with model size
-        config["model_config"]["mla_config"]["q_lora_rank"] = model_size["hidden_size"] * 2
+        config["model_config"]["mla_config"]["q_lora_rank"] = model_size["hidden_size"] // 2
         config["model_config"]["mla_config"]["kv_lora_rank"] = model_size["hidden_size"] // 2
         
         # Set use_peer based on experiment configuration
