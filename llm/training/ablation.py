@@ -18,204 +18,355 @@ import os
 import subprocess
 import time
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import yaml
+import numpy as np
+
+
+# Constants for the paper's ablation experiments
+FP8_BYTES = 1  # 1 byte per parameter in FP8
+EXPERT_SIZE_KB = 56  # Target expert size from paper (56KB in FP8)
+EXPERT_SIZE_BYTES = EXPERT_SIZE_KB * 1024
+COMPUTE_BUDGET = 3.0e24  # 3.0 × 10^24 FLOPs from paper
+STANDARD_VOCAB_SIZE = 200064  # o200k_base vocab size
+
+
+def calculate_expert_hidden_size(target_size_bytes: int, hidden_size: int, fp8: bool = True) -> int:
+    """
+    Calculate expert_hidden_size to achieve target expert size in bytes.
+    
+    For PEER experts, the size is approximately:
+    size = (hidden_size * expert_hidden_size + expert_hidden_size) * bytes_per_param
+    
+    Args:
+        target_size_bytes: Target size in bytes
+        hidden_size: Model hidden size
+        fp8: Whether using FP8 precision
+        
+    Returns:
+        expert_hidden_size value
+    """
+    bytes_per_param = FP8_BYTES if fp8 else 4
+    # Solve for expert_hidden_size
+    expert_hidden_size = target_size_bytes / (bytes_per_param * (hidden_size + 1))
+    return int(expert_hidden_size)
+
+
+def calculate_total_params(config: Dict) -> int:
+    """
+    Calculate total model parameters based on configuration.
+    
+    Args:
+        config: Model configuration dict
+        
+    Returns:
+        Total parameter count
+    """
+    hidden_size = config["model_config"]["hidden_size"]
+    num_layers = config["model_config"]["num_hidden_layers"]
+    vocab_size = config["model_config"]["vocab_size"]
+    intermediate_size = config["model_config"]["intermediate_size"]
+    
+    # Embedding parameters
+    embedding_params = vocab_size * hidden_size
+    
+    # Attention parameters (simplified, assuming MLA compression)
+    # MLA reduces KV parameters significantly
+    mla_config = config["model_config"].get("mla_config", {})
+    q_lora_rank = mla_config.get("q_lora_rank", hidden_size // 2)
+    kv_lora_rank = mla_config.get("kv_lora_rank", hidden_size // 4)
+    
+    attention_params_per_layer = (
+        hidden_size * q_lora_rank +  # Q projection
+        hidden_size * kv_lora_rank * 2 +  # K,V projections
+        hidden_size * hidden_size  # Output projection
+    )
+    
+    # FFN or PEER parameters per layer
+    if config["model_config"]["use_peer"]:
+        peer_config = config["model_config"]["peer_config"]
+        num_experts = peer_config["num_experts"]
+        expert_hidden_size = peer_config["expert_hidden_size"]
+        peer_start_layer = config["model_config"]["peer_start_layer"]
+        
+        # Dense FFN layers before PEER starts
+        dense_ffn_params = intermediate_size * hidden_size * 2 * peer_start_layer
+        
+        # PEER layers
+        peer_layers = num_layers - peer_start_layer
+        expert_params = num_experts * expert_hidden_size * (hidden_size + 1)  # +1 for bias
+        peer_params = expert_params * peer_layers
+        
+        ffn_params = dense_ffn_params + peer_params
+    else:
+        # All dense FFN
+        ffn_params = num_layers * intermediate_size * hidden_size * 2
+    
+    # Layer norm parameters
+    ln_params = num_layers * hidden_size * 2  # Pre and post LN
+    
+    total_params = embedding_params + num_layers * attention_params_per_layer + ffn_params + ln_params
+    return int(total_params)
+
+
+def calculate_active_params(config: Dict) -> int:
+    """
+    Calculate active parameters per token.
+    
+    Args:
+        config: Model configuration dict
+        
+    Returns:
+        Active parameter count per token
+    """
+    hidden_size = config["model_config"]["hidden_size"]
+    num_layers = config["model_config"]["num_hidden_layers"]
+    vocab_size = config["model_config"]["vocab_size"]
+    intermediate_size = config["model_config"]["intermediate_size"]
+    
+    # Embedding parameters (always active)
+    embedding_params = hidden_size  # Only one token embedding is active
+    
+    # Attention parameters (all active per layer)
+    mla_config = config["model_config"].get("mla_config", {})
+    q_lora_rank = mla_config.get("q_lora_rank", hidden_size // 2)
+    kv_lora_rank = mla_config.get("kv_lora_rank", hidden_size // 4)
+    
+    attention_params_per_layer = (
+        hidden_size * q_lora_rank +
+        hidden_size * kv_lora_rank * 2 +
+        hidden_size * hidden_size
+    )
+    
+    # FFN or PEER active parameters per layer
+    if config["model_config"]["use_peer"]:
+        peer_config = config["model_config"]["peer_config"]
+        num_experts_per_tok = peer_config["num_experts_per_tok"]
+        expert_hidden_size = peer_config["expert_hidden_size"]
+        peer_start_layer = config["model_config"]["peer_start_layer"]
+        
+        # Dense FFN layers before PEER
+        dense_ffn_active = intermediate_size * hidden_size * 2 * peer_start_layer
+        
+        # PEER layers - only activated experts count
+        peer_layers = num_layers - peer_start_layer
+        peer_active_per_layer = num_experts_per_tok * expert_hidden_size * (hidden_size + 1)
+        peer_active = peer_active_per_layer * peer_layers
+        
+        ffn_active = dense_ffn_active + peer_active
+    else:
+        # All dense FFN
+        ffn_active = num_layers * intermediate_size * hidden_size * 2
+    
+    # Layer norm parameters
+    ln_params = num_layers * hidden_size * 2
+    
+    active_params = embedding_params + num_layers * attention_params_per_layer + ffn_active + ln_params
+    return int(active_params)
+
+
+def activation_percentage_to_num_experts(percentage: float, num_experts: int) -> int:
+    """
+    Convert activation percentage to num_experts_per_tok.
+    
+    Args:
+        percentage: Activation percentage (e.g., 1.5 for 1.5%)
+        num_experts: Total number of experts
+        
+    Returns:
+        num_experts_per_tok value
+    """
+    return max(1, int(num_experts * percentage / 100.0))
+
+
+def generate_model_size_from_params(target_params: int, base_hidden_size: int = 768) -> Dict:
+    """
+    Generate model configuration to achieve target parameter count.
+    
+    Args:
+        target_params: Target total parameter count
+        base_hidden_size: Base hidden size to scale from
+        
+    Returns:
+        Dict with hidden_size, num_hidden_layers, intermediate_size
+    """
+    # Simple scaling heuristic - scale hidden size and adjust layers
+    # This is approximate and may need fine-tuning
+    
+    if target_params < 1e9:  # < 1B params
+        scale = (target_params / 300e6) ** 0.5
+        hidden_size = int(base_hidden_size * scale)
+        hidden_size = (hidden_size // 64) * 64  # Round to multiple of 64
+        num_layers = 12
+        intermediate_size = hidden_size * 4
+    elif target_params < 10e9:  # 1B - 10B params
+        scale = (target_params / 1e9) ** 0.5
+        hidden_size = int(1024 * scale)
+        hidden_size = (hidden_size // 64) * 64
+        num_layers = 24
+        intermediate_size = hidden_size * 4
+    else:  # > 10B params
+        scale = (target_params / 10e9) ** 0.5
+        hidden_size = int(2048 * scale)
+        hidden_size = (hidden_size // 128) * 128  # Round to multiple of 128
+        num_layers = 32
+        intermediate_size = int(hidden_size * 3.5)
+    
+    return {
+        "hidden_size": hidden_size,
+        "num_hidden_layers": num_layers,
+        "intermediate_size": intermediate_size
+    }
+
 
 # Define ablation configuration spaces for each axis
-# Calculated expert_hidden_size for 228KB FP8 experts with hidden_size=768
-EXPERT_HIDDEN_SIZE_CALC = 152
-
 ABLATION_CONFIGS = {
-    # 1. Initial data mix ablations
-    "data_mix": [
+    # Ablation 1: Model-Capacity Sweep at Constant P_act
+    # C_act = 2048, s_exp = 56KB, vary N_tot from 0 (dense) to 4.2M
+    "capacity_sweep": [
         {
-            "name": "web_heavy",
-            "datasets": [
-                {
-                    "name": "fineweb",
-                    "path": "HuggingFaceFW/fineweb",
-                    "subset": "sample/10BT", # Specify subset for FineWeb
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.6,
-                    "text_field": "text",
-                },
-                {
-                    "name": "wikipedia",
-                    "path": "wikimedia/wikipedia",
-                    "subset": "20231101.en", # Specify Wikipedia dump version
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.2,
-                    "text_field": "text",
-                },
-                {
-                    "name": "github_code",
-                    "path": "codeparrot/github-code",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.1,
-                    "text_field": "code",
-                },
-                {
-                    "name": "openr1_math",
-                    "path": "open-r1/OpenR1-Math-220k",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.1,
-                    "text_field": "problem",
-                },
-            ],
+            "name": "dense_baseline",
+            "use_peer": False,  # Dense model (no experts)
+            "target_params": 1e9,  # 1B params
         },
         {
-            "name": "code_heavy",
-            "datasets": [
-                {
-                    "name": "fineweb",
-                    "path": "HuggingFaceFW/fineweb",
-                    "subset": "sample/10BT",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.3,
-                    "text_field": "text",
-                },
-                {
-                    "name": "github_code",
-                    "path": "codeparrot/github-code",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.4,
-                    "text_field": "code",
-                },
-                {
-                    "name": "opencode_reasoning",
-                    "path": "nvidia/OpenCodeReasoning",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.2,
-                    "text_field": "input",
-                },
-                 {
-                    "name": "wikipedia",
-                    "path": "wikimedia/wikipedia",
-                    "subset": "20231101.en",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.1,
-                    "text_field": "text",
-                },
-            ],
+            "name": "1B_65k_experts",
+            "use_peer": True,
+            "num_experts": 65536,  # 2^16
+            "target_params": 1e9,
         },
         {
-            "name": "math_heavy",
-            "datasets": [
-                {
-                    "name": "fineweb",
-                    "path": "HuggingFaceFW/fineweb",
-                    "name": "sample/10BT",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.4,
-                    "text_field": "text",
-                },
-                {
-                    "name": "openr1_math",
-                    "path": "open-r1/OpenR1-Math-220k",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.4,
-                    "text_field": "problem",
-                },
-                {
-                    "name": "wikipedia",
-                    "path": "wikimedia/wikipedia",
-                    "name": "20231101.en",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.1,
-                    "text_field": "text",
-                },
-                {
-                    "name": "github_code",
-                    "path": "codeparrot/github-code",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.1,
-                    "text_field": "code",
-                },
-            ],
+            "name": "4B_262k_experts",
+            "use_peer": True,
+            "num_experts": 262144,  # 2^18
+            "target_params": 4e9,
         },
         {
-            "name": "balanced",
-            "datasets": [
-                {
-                    "name": "fineweb",
-                    "path": "HuggingFaceFW/fineweb",
-                    "name": "sample/10BT",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.4,
-                    "text_field": "text",
-                },
-                {
-                    "name": "github_code",
-                    "path": "codeparrot/github-code",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.25,
-                    "text_field": "code",
-                },
-                {
-                    "name": "openr1_math",
-                    "path": "open-r1/OpenR1-Math-220k",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.2,
-                    "text_field": "problem",
-                },
-                {
-                    "name": "wikipedia",
-                    "path": "wikimedia/wikipedia",
-                    "name": "20231101.en",
-                    "split": "train",
-                    "streaming": True,
-                    "weight": 0.15,
-                    "text_field": "text",
-                },
-            ],
+            "name": "16B_1M_experts",
+            "use_peer": True,
+            "num_experts": 1048576,  # 2^20
+            "target_params": 16e9,
+        },
+        {
+            "name": "64B_2M_experts",
+            "use_peer": True,
+            "num_experts": 2097152,  # 2^21
+            "target_params": 64e9,
+        },
+        {
+            "name": "250B_4M_experts",
+            "use_peer": True,
+            "num_experts": 4194304,  # 2^22 ≈ 4.2M
+            "target_params": 250e9,
         },
     ],
-    # 2. Expert setup (combining count, dimensions, and size)
-    "expert_setup": [
+    
+    # Ablation 2: Expert-Granularity Sweep at Constant Capacity
+    # Start from 4B params (N_tot = 65,536), quarter s_exp and quadruple N_tot
+    "granularity_sweep": [
         {
-            "name": "2d_1M_152h",
-            "num_experts": 1048576,
-            "product_key_dim": [1024, 1024],
-            "expert_hidden_size": EXPERT_HIDDEN_SIZE_CALC,
+            "name": "4B_65k_56KB",
+            "num_experts": 65536,
+            "expert_size_kb": 56,  # Base size
+            "num_experts_per_tok": 2048,  # C_act = 2048
         },
         {
-            "name": "3d_1M_152h",
-            "num_experts": 1000000, # Note: 100^3 = 1,000,000
-            "product_key_dim": [100, 100, 100],
-            "expert_hidden_size": EXPERT_HIDDEN_SIZE_CALC,
+            "name": "4B_262k_14KB",
+            "num_experts": 262144,  # 4x experts
+            "expert_size_kb": 14,  # 1/4 size
+            "num_experts_per_tok": 512,  # 1/4 C_act
         },
         {
-            "name": "4d_1M_152h",
-            "num_experts": 1048576, # Note: 32^4 = 1,048,576
-            "product_key_dim": [32, 32, 32, 32],
-            "expert_hidden_size": EXPERT_HIDDEN_SIZE_CALC,
+            "name": "4B_1M_3.5KB",
+            "num_experts": 1048576,  # 16x experts
+            "expert_size_kb": 3.5,  # 1/16 size
+            "num_experts_per_tok": 128,  # 1/16 C_act
+        },
+        {
+            "name": "4B_4M_0.875KB",
+            "num_experts": 4194304,  # 64x experts
+            "expert_size_kb": 0.875,  # 1/64 size
+            "num_experts_per_tok": 32,  # 1/64 C_act
         },
     ],
-    # 3. Number of expert selection heads and experts per token
-    "selection_heads": [
-        {"name": "h4_k32", "num_heads": 4, "num_experts_per_tok": 32},
-        {"name": "h8_k16", "num_heads": 8, "num_experts_per_tok": 16},
-        {"name": "h16_k8", "num_heads": 16, "num_experts_per_tok": 8},
-        {"name": "h32_k4", "num_heads": 32, "num_experts_per_tok": 4},
+    
+    # Ablation 3: Compute-Budget Trade-off
+    # Fixed compute C = 3.0 × 10^24 FLOPs
+    "compute_tradeoff": [
+        {
+            "name": "small_model_many_tokens",
+            "target_params": 1e9,  # 1B params
+            "training_tokens": 3e12,  # 3T tokens
+        },
+        {
+            "name": "medium_model_balanced",
+            "target_params": 4e9,  # 4B params
+            "training_tokens": 750e9,  # 750B tokens
+        },
+        {
+            "name": "large_model_fewer_tokens",
+            "target_params": 16e9,  # 16B params
+            "training_tokens": 187.5e9,  # 187.5B tokens
+        },
+        {
+            "name": "xlarge_model_minimal_tokens",
+            "target_params": 64e9,  # 64B params
+            "training_tokens": 46.875e9,  # 46.875B tokens
+        },
+    ],
+    
+    # Ablation 4: Activation Sweep in 4B-Parameter Regime
+    # Fixed at 4B params (N_tot = 65,536), vary activation 1.5% to 12.5%
+    "activation_4b": [
+        {
+            "name": "4B_1.5pct",
+            "num_experts": 65536,
+            "activation_percentage": 1.5,
+        },
+        {
+            "name": "4B_3pct",
+            "num_experts": 65536,
+            "activation_percentage": 3.0,
+        },
+        {
+            "name": "4B_6pct",
+            "num_experts": 65536,
+            "activation_percentage": 6.0,
+        },
+        {
+            "name": "4B_12.5pct",
+            "num_experts": 65536,
+            "activation_percentage": 12.5,
+        },
+    ],
+    
+    # Ablation 5: Activation Sweep in 256B-Parameter Regime
+    # Fixed at 256B params (N_tot = 4.19M), vary activation 1.5% to 12.5%
+    "activation_256b": [
+        {
+            "name": "256B_1.5pct",
+            "num_experts": 4194304,  # ~4.19M
+            "activation_percentage": 1.5,
+        },
+        {
+            "name": "256B_3pct",
+            "num_experts": 4194304,
+            "activation_percentage": 3.0,
+        },
+        {
+            "name": "256B_6pct",
+            "num_experts": 4194304,
+            "activation_percentage": 6.0,
+        },
+        {
+            "name": "256B_12.5pct",
+            "num_experts": 4194304,
+            "activation_percentage": 12.5,
+        },
     ],
 }
 
@@ -235,7 +386,7 @@ def create_experiment_folder(output_dir: str) -> str:
     return experiment_dir
 
 
-def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str) -> str:
+def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ablation_type: str) -> Tuple[str, str]:
     """
     Generate a configuration file for a specific experiment.
 
@@ -243,62 +394,155 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str) ->
         base_config: Base configuration dictionary
         experiment: Experiment-specific configuration dictionary
         experiment_dir: Path to experiment directory
+        ablation_type: Type of ablation being run
 
     Returns:
-        Path to the generated configuration file
+        Tuple of (config_path, experiment_name)
     """
     # Create a deep copy of the base configuration
     config = copy.deepcopy(base_config)
+    
+    # Ensure vocab_size is set correctly
+    config["model_config"]["vocab_size"] = STANDARD_VOCAB_SIZE
 
-    # Apply experiment-specific configurations
-    experiment_name_parts = []
-
-    # 1. Apply data mix configuration if present
-    if "data_mix" in experiment:
-        data_mix = experiment["data_mix"]
-        config["dataset_config"]["datasets"] = data_mix["datasets"]
-        experiment_name_parts.append(f"data-{data_mix['name']}")
-
-    # 2. Apply expert setup configuration if present
-    if "expert_setup" in experiment:
-        expert_setup = experiment["expert_setup"]
-        config["model_config"]["peer_config"]["num_experts"] = expert_setup[
-            "num_experts"
-        ]
-        config["model_config"]["peer_config"]["product_key_dim"] = expert_setup[
-            "product_key_dim"
-        ]
-        config["model_config"]["peer_config"]["expert_hidden_size"] = expert_setup[
-            "expert_hidden_size"
-        ]
-        experiment_name_parts.append(f"expert-{expert_setup['name']}")
-
-    # 3. Apply selection heads configuration if present
-    if "selection_heads" in experiment:
-        selection_heads = experiment["selection_heads"]
-        config["model_config"]["peer_config"]["num_heads"] = selection_heads[
-            "num_heads"
-        ]
-        config["model_config"]["peer_config"]["num_experts_per_tok"] = selection_heads[
-            "num_experts_per_tok"
-        ]
-        experiment_name_parts.append(f"heads-{selection_heads['name']}")
-
-    # Set unique experiment name
-    experiment_name = "_".join(experiment_name_parts)
+    # Apply experiment-specific configurations based on ablation type
+    experiment_name = experiment["name"]
+    
+    if ablation_type == "capacity_sweep":
+        # Ablation 1: Model-Capacity Sweep
+        model_size = generate_model_size_from_params(experiment["target_params"])
+        config["model_config"]["hidden_size"] = model_size["hidden_size"]
+        config["model_config"]["num_hidden_layers"] = model_size["num_hidden_layers"]
+        config["model_config"]["intermediate_size"] = model_size["intermediate_size"]
+        
+        # Update MLA config to scale with model size
+        config["model_config"]["mla_config"]["q_lora_rank"] = model_size["hidden_size"] * 2
+        config["model_config"]["mla_config"]["kv_lora_rank"] = model_size["hidden_size"] // 2
+        
+        if experiment["use_peer"]:
+            # PEER configuration
+            config["model_config"]["use_peer"] = True
+            config["model_config"]["peer_start_layer"] = 2
+            config["model_config"]["peer_config"]["num_experts"] = experiment["num_experts"]
+            config["model_config"]["peer_config"]["num_experts_per_tok"] = 2048  # C_act = 2048
+            
+            # Calculate expert_hidden_size for 56KB experts
+            expert_hidden_size = calculate_expert_hidden_size(EXPERT_SIZE_BYTES, model_size["hidden_size"])
+            config["model_config"]["peer_config"]["expert_hidden_size"] = expert_hidden_size
+            
+            # Set product key dimensions based on number of experts
+            if experiment["num_experts"] <= 65536:
+                config["model_config"]["peer_config"]["product_key_dim"] = [256, 256]
+            elif experiment["num_experts"] <= 1048576:
+                config["model_config"]["peer_config"]["product_key_dim"] = [1024, 1024]
+            else:
+                config["model_config"]["peer_config"]["product_key_dim"] = [2048, 2048]
+        else:
+            # Dense baseline - set peer_start_layer >= num_hidden_layers
+            config["model_config"]["use_peer"] = True  # Keep True but disable via layer index
+            config["model_config"]["peer_start_layer"] = config["model_config"]["num_hidden_layers"]
+            
+    elif ablation_type == "granularity_sweep":
+        # Ablation 2: Expert-Granularity Sweep
+        # Fixed 4B parameter model
+        model_size = generate_model_size_from_params(4e9)
+        config["model_config"]["hidden_size"] = model_size["hidden_size"]
+        config["model_config"]["num_hidden_layers"] = model_size["num_hidden_layers"]
+        config["model_config"]["intermediate_size"] = model_size["intermediate_size"]
+        
+        config["model_config"]["use_peer"] = True
+        config["model_config"]["peer_start_layer"] = 2
+        config["model_config"]["peer_config"]["num_experts"] = experiment["num_experts"]
+        config["model_config"]["peer_config"]["num_experts_per_tok"] = experiment["num_experts_per_tok"]
+        
+        # Calculate expert_hidden_size based on target size
+        target_bytes = int(experiment["expert_size_kb"] * 1024)
+        expert_hidden_size = calculate_expert_hidden_size(target_bytes, model_size["hidden_size"])
+        config["model_config"]["peer_config"]["expert_hidden_size"] = expert_hidden_size
+        
+        # Set product key dimensions
+        if experiment["num_experts"] <= 65536:
+            config["model_config"]["peer_config"]["product_key_dim"] = [256, 256]
+        elif experiment["num_experts"] <= 1048576:
+            config["model_config"]["peer_config"]["product_key_dim"] = [1024, 1024]
+        else:
+            config["model_config"]["peer_config"]["product_key_dim"] = [2048, 2048]
+            
+    elif ablation_type == "compute_tradeoff":
+        # Ablation 3: Compute-Budget Trade-off
+        model_size = generate_model_size_from_params(experiment["target_params"])
+        config["model_config"]["hidden_size"] = model_size["hidden_size"]
+        config["model_config"]["num_hidden_layers"] = model_size["num_hidden_layers"]
+        config["model_config"]["intermediate_size"] = model_size["intermediate_size"]
+        
+        # Use PEER for all models in compute tradeoff
+        config["model_config"]["use_peer"] = True
+        config["model_config"]["peer_start_layer"] = 2
+        
+        # Scale experts with model size
+        if experiment["target_params"] < 4e9:
+            num_experts = 65536
+        elif experiment["target_params"] < 16e9:
+            num_experts = 262144
+        elif experiment["target_params"] < 64e9:
+            num_experts = 1048576
+        else:
+            num_experts = 2097152
+            
+        config["model_config"]["peer_config"]["num_experts"] = num_experts
+        config["model_config"]["peer_config"]["num_experts_per_tok"] = 2048  # Fixed C_act
+        
+        expert_hidden_size = calculate_expert_hidden_size(EXPERT_SIZE_BYTES, model_size["hidden_size"])
+        config["model_config"]["peer_config"]["expert_hidden_size"] = expert_hidden_size
+        
+        # Set training tokens
+        config["train_config"]["max_steps"] = int(experiment["training_tokens"] / 
+                                                  (config["train_config"]["per_device_train_batch_size"] * 
+                                                   config["dataset_config"]["max_seq_length"]))
+        
+    elif ablation_type in ["activation_4b", "activation_256b"]:
+        # Ablations 4 & 5: Activation Sweeps
+        if ablation_type == "activation_4b":
+            target_params = 4e9
+        else:
+            target_params = 256e9
+            
+        model_size = generate_model_size_from_params(target_params)
+        config["model_config"]["hidden_size"] = model_size["hidden_size"]
+        config["model_config"]["num_hidden_layers"] = model_size["num_hidden_layers"]
+        config["model_config"]["intermediate_size"] = model_size["intermediate_size"]
+        
+        config["model_config"]["use_peer"] = True
+        config["model_config"]["peer_start_layer"] = 2
+        config["model_config"]["peer_config"]["num_experts"] = experiment["num_experts"]
+        
+        # Convert activation percentage to num_experts_per_tok
+        num_experts_per_tok = activation_percentage_to_num_experts(
+            experiment["activation_percentage"], experiment["num_experts"]
+        )
+        config["model_config"]["peer_config"]["num_experts_per_tok"] = num_experts_per_tok
+        
+        expert_hidden_size = calculate_expert_hidden_size(EXPERT_SIZE_BYTES, model_size["hidden_size"])
+        config["model_config"]["peer_config"]["expert_hidden_size"] = expert_hidden_size
+        
+        # Set product key dimensions
+        if experiment["num_experts"] <= 65536:
+            config["model_config"]["peer_config"]["product_key_dim"] = [256, 256]
+        else:
+            config["model_config"]["peer_config"]["product_key_dim"] = [2048, 2048]
 
     # Update configuration with unique experiment name and output directory
-    config["wandb_config"]["name"] = f"ablation_{experiment_name}"
+    config["wandb_config"]["name"] = f"ablation_{ablation_type}_{experiment_name}"
     config["train_config"]["output_dir"] = os.path.join(
-        experiment_dir, "checkpoints", experiment_name
+        experiment_dir, "checkpoints", f"{ablation_type}_{experiment_name}"
     )
 
     # Save configuration to file
-    config_path = os.path.join(experiment_dir, "configs", f"{experiment_name}.yaml")
+    config_path = os.path.join(experiment_dir, "configs", f"{ablation_type}_{experiment_name}.yaml")
     with open(config_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
 
-    return config_path, experiment_name
+    return config_path, f"{ablation_type}_{experiment_name}"
 
 
 def run_training(
@@ -741,40 +985,26 @@ def evaluate_checkpoint(
     return results
 
 
-def generate_experiment_combinations(selected_axes: List[str] = None) -> List[Dict]:
+def generate_experiment_combinations(selected_axes: List[str] = None) -> List[Tuple[str, Dict]]:
     """
-    Generate all combinations of experiment configurations.
+    Generate all experiment configurations.
 
     Args:
-        selected_axes: List of axes to include in combinations (default: all axes)
+        selected_axes: List of ablation types to include (default: all types)
 
     Returns:
-        List of experiment configurations
+        List of tuples (ablation_type, experiment_config)
     """
     if selected_axes is None:
         selected_axes = list(ABLATION_CONFIGS.keys())
 
-    # Get configurations for selected axes
-    selected_configs = {axis: ABLATION_CONFIGS[axis] for axis in selected_axes}
-
-    # Generate combinations
-    axes_names = list(selected_configs.keys())
     combinations = []
-
-    # Get all combinations
-    if len(axes_names) == 1:
-        # Only one axis selected
-        axis = axes_names[0]
-        for config in selected_configs[axis]:
-            combinations.append({axis: config})
-    else:
-        # Multiple axes selected, generate all combinations
-        axis_values = [selected_configs[axis] for axis in axes_names]
-        for combo in itertools.product(*axis_values):
-            experiment = {}
-            for i, axis in enumerate(axes_names):
-                experiment[axis] = combo[i]
-            combinations.append(experiment)
+    
+    # For the new structure, each ablation type has its own list of experiments
+    for ablation_type in selected_axes:
+        if ablation_type in ABLATION_CONFIGS:
+            for experiment in ABLATION_CONFIGS[ablation_type]:
+                combinations.append((ablation_type, experiment))
 
     return combinations
 
@@ -856,7 +1086,7 @@ def add_custom_dataset_mixes(ablation_configs, custom_datasets_path=None):
 
 def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
     """
-    Summarize and visualize ablation results.
+    Summarize and visualize ablation results according to paper's hypotheses.
 
     Args:
         results_list: List of results from experiments
@@ -874,140 +1104,200 @@ def summarize_results(results_list: List[Dict], experiment_dir: str) -> None:
     viz_dir = os.path.join(experiment_dir, "visualizations")
     os.makedirs(viz_dir, exist_ok=True)
 
-    # Get benchmark names from the first result that has them
-    benchmark_names = []
-    for result in results_list:
-        potential_benchmarks = [
-            "aime_2024",
-            "codeforces",
-            "gpqa_diamond",
-            "math_500",
-            "mmlu",
-            "swe_bench",
-        ]
-        for benchmark in potential_benchmarks:
-            if benchmark in result and result[benchmark] is not None:
-                benchmark_names.append(benchmark)
-        if benchmark_names:
-            break
+    # Group results by ablation type
+    ablation_groups = df.groupby('ablation_type') if 'ablation_type' in df.columns else {}
 
-    # If no benchmarks found, use defaults
-    if not benchmark_names:
-        benchmark_names = ["perplexity"]
-
-    # 1. Analyze by number of parameters vs. perplexity
-    plt.figure(figsize=(12, 8))
-    # Check if required columns exist
-    if "total_params" in df.columns and "perplexity" in df.columns:
-        sns.scatterplot(
-            data=df,
-            x="total_params",
-            y="perplexity",
-            hue="experiment_type" if "experiment_type" in df.columns else None, # Color by the combination of axes tested
-            size="active_params_ratio" if "active_params_ratio" in df.columns else None,
-            sizes=(100, 400),
-            alpha=0.7,
-        )
-    plt.xscale("log")
-    plt.title("Total Parameters vs. Perplexity")
-    plt.xlabel("Total Parameters")
-    plt.ylabel("Perplexity (lower is better)")
-    plt.savefig(os.path.join(viz_dir, "params_vs_perplexity.png"))
-    plt.close()
-
-    # 2. Analyze by active parameters ratio vs. perplexity
-    plt.figure(figsize=(12, 8))
-    sns.scatterplot(
-        data=df,
-        x="active_params_ratio",
-        y="perplexity",
-        hue="experiment_type",
-        style="expert_setup_config" if "expert_setup_config" in df else None, # Style by expert setup
-        s=150,
-        alpha=0.8,
-    )
-    plt.title("Active Parameter Ratio vs. Perplexity")
-    plt.xlabel("Active Parameters Ratio")
-    plt.ylabel("Perplexity (lower is better)")
-    plt.savefig(os.path.join(viz_dir, "active_ratio_vs_perplexity.png"))
-    plt.close()
-
-    # 3. Create benchmark comparison plots
-    for benchmark in benchmark_names:
-        if benchmark == "perplexity":
-            # Already handled above
-            continue
-
-        # Check if we have data for this benchmark
-        if benchmark not in df.columns or df[benchmark].isna().all():
-            continue
-
-        # Create visualization for this benchmark vs Total Params
+    # 1. Ablation 1: Model-Capacity Sweep (H3: PPL ∝ P_cap^-λ)
+    if 'capacity_sweep' in ablation_groups:
+        capacity_df = ablation_groups.get_group('capacity_sweep')
+        
         plt.figure(figsize=(12, 8))
-        sns.scatterplot(
-            data=df,
-            x="total_params",
-            y=benchmark,
-            hue="experiment_type",
-            style="expert_setup_config" if "expert_setup_config" in df else None,
-            size="active_params_ratio",
-            sizes=(100, 400),
-            alpha=0.7,
-        )
-        plt.xscale("log")
-
-        # Different benchmarks have different interpretation (higher/lower better)
-        ylabel_suffix = ""
-        if benchmark in [
-            "aime_2024",
-            "codeforces",
-            "gpqa_diamond",
-            "math_500",
-            "mmlu",
-            "swe_bench",
-        ]:
-            ylabel_suffix = " (higher is better)"
-
-        plt.title(f"Model Size vs. {benchmark.replace('_', ' ').title()}")
-        plt.xlabel("Total Parameters")
-        plt.ylabel(f"{benchmark.replace('_', ' ').title()}{ylabel_suffix}")
-        plt.savefig(os.path.join(viz_dir, f"total_params_vs_{benchmark}.png"))
+        plt.scatter(capacity_df['total_params'], capacity_df['perplexity'], 
+                   s=150, alpha=0.7, label='Data')
+        
+        # Fit power law PPL ∝ P_cap^-λ
+        non_inf_mask = capacity_df['perplexity'] != float('inf')
+        if non_inf_mask.sum() > 2:
+            x = np.log10(capacity_df.loc[non_inf_mask, 'total_params'])
+            y = np.log10(capacity_df.loc[non_inf_mask, 'perplexity'])
+            z = np.polyfit(x, y, 1)
+            lambda_val = -z[0]
+            
+            # Plot fit
+            x_fit = np.logspace(np.log10(capacity_df['total_params'].min()), 
+                               np.log10(capacity_df['total_params'].max()), 100)
+            y_fit = 10**(z[1]) * x_fit**z[0]
+            plt.plot(x_fit, y_fit, 'r--', label=f'Fit: λ={lambda_val:.3f}')
+        
+        plt.xscale('log')
+        plt.yscale('log')
+        plt.xlabel('Total Parameters (P_cap)')
+        plt.ylabel('Perplexity')
+        plt.title('Ablation 1: Model-Capacity Sweep (H3: PPL ∝ P_cap^-λ)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(viz_dir, 'ablation1_capacity_sweep.png'))
         plt.close()
 
-        # Create visualization for this benchmark vs Active Params Ratio
-        plt.figure(figsize=(12, 8))
-        sns.scatterplot(
-            data=df,
-            x="active_params_ratio",
-            y=benchmark,
-            hue="experiment_type",
-            style="expert_setup_config" if "expert_setup_config" in df else None,
-            s=150,
-            alpha=0.8,
-        )
-        plt.title(f"Active Parameter Ratio vs. {benchmark.replace('_', ' ').title()}")
-        plt.xlabel("Active Parameters Ratio")
-        plt.ylabel(f"{benchmark.replace('_', ' ').title()}{ylabel_suffix}")
-        plt.savefig(os.path.join(viz_dir, f"active_ratio_vs_{benchmark}.png"))
-        plt.close()
-
-
-        # Create comparison bar plot by experiment name
-        plt.figure(figsize=(max(15, len(df) * 0.5), 8)) # Adjust width based on number of experiments
-        plot_data = df[df[benchmark].notna()].copy()
-        if len(plot_data) < 1:
-            continue
-
-        # Sort by benchmark score
-        higher_is_better = benchmark != "perplexity"
-        plot_data = plot_data.sort_values(benchmark, ascending=not higher_is_better)
-
-        sns.barplot(data=plot_data, x="experiment_name", y=benchmark, hue="experiment_type", dodge=False)
-        plt.xticks(rotation=90)
-        plt.title(f"{benchmark.replace('_', ' ').title()} by Experiment")
+    # 2. Ablation 2: Expert-Granularity Sweep (H1: TPS ∝ s_exp^-1)
+    if 'granularity_sweep' in ablation_groups:
+        gran_df = ablation_groups.get_group('granularity_sweep')
+        
+        # Calculate expert size in bytes
+        gran_df['expert_size_bytes'] = gran_df['expert_size_kb'] * 1024
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+        
+        # H1: Throughput vs expert size (would need TPS data)
+        # For now, plot active params vs expert size
+        ax1.scatter(gran_df['expert_size_bytes'], gran_df['active_params'], 
+                   s=150, alpha=0.7)
+        ax1.set_xscale('log')
+        ax1.set_xlabel('Expert Size (bytes)')
+        ax1.set_ylabel('Active Parameters')
+        ax1.set_title('Active Parameters vs Expert Size')
+        ax1.grid(True, alpha=0.3)
+        
+        # H2: PPL vs active params
+        ax2.scatter(gran_df['active_params'], gran_df['perplexity'], 
+                   s=150, alpha=0.7, label='Data')
+        
+        # Fit power law PPL ∝ P_act^-δ
+        non_inf_mask = gran_df['perplexity'] != float('inf')
+        if non_inf_mask.sum() > 2:
+            x = np.log10(gran_df.loc[non_inf_mask, 'active_params'])
+            y = np.log10(gran_df.loc[non_inf_mask, 'perplexity'])
+            z = np.polyfit(x, y, 1)
+            delta_val = -z[0]
+            
+            x_fit = np.logspace(np.log10(gran_df['active_params'].min()), 
+                               np.log10(gran_df['active_params'].max()), 100)
+            y_fit = 10**(z[1]) * x_fit**z[0]
+            ax2.plot(x_fit, y_fit, 'r--', label=f'Fit: δ={delta_val:.3f}')
+        
+        ax2.set_xscale('log')
+        ax2.set_yscale('log')
+        ax2.set_xlabel('Active Parameters (P_act)')
+        ax2.set_ylabel('Perplexity')
+        ax2.set_title('H2: PPL ∝ P_act^-δ')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.suptitle('Ablation 2: Expert-Granularity Sweep')
         plt.tight_layout()
-        plt.savefig(os.path.join(viz_dir, f"{benchmark}_by_experiment.png"))
+        plt.savefig(os.path.join(viz_dir, 'ablation2_granularity_sweep.png'))
         plt.close()
+
+    # 3. Ablation 3: Compute-Budget Trade-off
+    if 'compute_tradeoff' in ablation_groups:
+        compute_df = ablation_groups.get_group('compute_tradeoff')
+        
+        plt.figure(figsize=(12, 8))
+        
+        # Plot perplexity vs model size, with bubble size = training tokens
+        sizes = compute_df['training_tokens'] / 1e9  # Scale to billions
+        scatter = plt.scatter(compute_df['target_params'], compute_df['perplexity'], 
+                            s=sizes*10, alpha=0.6, c=compute_df['training_tokens'],
+                            cmap='viridis', edgecolors='black', linewidth=1)
+        
+        # Add labels for each point
+        for idx, row in compute_df.iterrows():
+            plt.annotate(f"{row['training_tokens']/1e9:.0f}B tokens", 
+                        (row['target_params'], row['perplexity']),
+                        xytext=(5, 5), textcoords='offset points', fontsize=9)
+        
+        plt.xscale('log')
+        plt.xlabel('Model Parameters')
+        plt.ylabel('Perplexity')
+        plt.title('Ablation 3: Compute-Budget Trade-off (Fixed Compute = 3.0e24 FLOPs)')
+        cbar = plt.colorbar(scatter)
+        cbar.set_label('Training Tokens')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(viz_dir, 'ablation3_compute_tradeoff.png'))
+        plt.close()
+
+    # 4. Ablations 4 & 5: Activation Sweeps
+    for ablation_name, title_suffix in [('activation_4b', '4B Parameters'), 
+                                        ('activation_256b', '256B Parameters')]:
+        if ablation_name in ablation_groups:
+            act_df = ablation_groups.get_group(ablation_name)
+            
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+            
+            # Perplexity vs activation percentage
+            ax1.scatter(act_df['activation_percentage'], act_df['perplexity'], 
+                       s=150, alpha=0.7)
+            ax1.set_xlabel('Activation Percentage (%)')
+            ax1.set_ylabel('Perplexity')
+            ax1.set_title(f'Perplexity vs Activation % ({title_suffix})')
+            ax1.grid(True, alpha=0.3)
+            
+            # Calculate actual active params for plotting
+            if 'num_experts' in act_df.columns:
+                act_df['calc_active_params'] = (act_df['activation_percentage'] / 100.0 * 
+                                               act_df['num_experts'] * EXPERT_SIZE_BYTES)
+            
+            # Perplexity vs active parameters
+            if 'active_params' in act_df.columns:
+                ax2.scatter(act_df['active_params'], act_df['perplexity'], 
+                           s=150, alpha=0.7, label='Data')
+                
+                # Fit power law
+                non_inf_mask = act_df['perplexity'] != float('inf')
+                if non_inf_mask.sum() > 2:
+                    x = np.log10(act_df.loc[non_inf_mask, 'active_params'])
+                    y = np.log10(act_df.loc[non_inf_mask, 'perplexity'])
+                    z = np.polyfit(x, y, 1)
+                    delta_val = -z[0]
+                    
+                    x_fit = np.logspace(np.log10(act_df['active_params'].min()), 
+                                       np.log10(act_df['active_params'].max()), 100)
+                    y_fit = 10**(z[1]) * x_fit**z[0]
+                    ax2.plot(x_fit, y_fit, 'r--', label=f'Fit: δ={delta_val:.3f}')
+                
+                ax2.set_xscale('log')
+                ax2.set_yscale('log')
+                ax2.set_xlabel('Active Parameters')
+                ax2.set_ylabel('Perplexity')
+                ax2.set_title(f'PPL vs Active Parameters ({title_suffix})')
+                ax2.legend()
+                ax2.grid(True, alpha=0.3)
+            
+            plt.suptitle(f'Ablation {4 if ablation_name == "activation_4b" else 5}: Activation Sweep')
+            plt.tight_layout()
+            plt.savefig(os.path.join(viz_dir, f'{ablation_name}_sweep.png'))
+            plt.close()
+
+    # Summary plot: All ablations on one figure
+    plt.figure(figsize=(16, 10))
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, len(df['ablation_type'].unique())))
+    
+    for i, (ablation_type, group_df) in enumerate(ablation_groups):
+        non_inf_mask = group_df['perplexity'] != float('inf')
+        plt.scatter(group_df.loc[non_inf_mask, 'active_params'], 
+                   group_df.loc[non_inf_mask, 'perplexity'],
+                   label=ablation_type.replace('_', ' ').title(),
+                   alpha=0.7, s=100, color=colors[i])
+    
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xlabel('Active Parameters')
+    plt.ylabel('Perplexity')
+    plt.title('All Ablations: Perplexity vs Active Parameters')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(viz_dir, 'all_ablations_summary.png'))
+    plt.close()
+    
+    # Print summary statistics
+    print("\n=== Ablation Results Summary ===")
+    for ablation_type, group_df in ablation_groups:
+        print(f"\n{ablation_type.replace('_', ' ').title()}:")
+        print(f"  Experiments: {len(group_df)}")
+        print(f"  Best perplexity: {group_df['perplexity'].min():.4f}")
+        print(f"  Avg perplexity: {group_df['perplexity'].mean():.4f}")
 
 
 def calculate_normalized_scores(
@@ -1130,12 +1420,9 @@ def run_ablation_study(
         json.dump(experiments, f, indent=2)
 
     # Run each experiment
-    for i, experiment in enumerate(experiments):
+    for i, (ablation_type, experiment) in enumerate(experiments):
         # Generate experiment name
-        experiment_name_parts = []
-        for axis, config in experiment.items():
-            experiment_name_parts.append(f"{axis}-{config['name']}")
-        experiment_name = "_".join(experiment_name_parts)
+        experiment_name = f"{ablation_type}_{experiment['name']}"
 
         # Skip if already completed
         if experiment_name in completed_experiments:
@@ -1146,7 +1433,7 @@ def run_ablation_study(
 
         # Generate configuration for this experiment
         config_path, experiment_name = generate_config(
-            base_config, experiment, experiment_dir
+            base_config, experiment, experiment_dir, ablation_type
         )
 
         # Run training
@@ -1171,26 +1458,40 @@ def run_ablation_study(
             print(f"Failed to evaluate checkpoint for experiment: {experiment_name}")
             continue
 
+        # Load the generated config to calculate params
+        with open(config_path, "r") as f:
+            experiment_config = yaml.safe_load(f)
+        
+        # Calculate total and active params for this experiment
+        total_params = calculate_total_params(experiment_config)
+        active_params = calculate_active_params(experiment_config)
+
         # Record results
         result = {
             "experiment_name": experiment_name,
+            "ablation_type": ablation_type,
             "perplexity": eval_results.get("perplexity", float("inf")),
-            "total_params": eval_results.get("total_params", 0),
-            "active_params": eval_results.get("active_params", 0),
-            "active_params_ratio": eval_results.get("active_params", 0)
-            / max(eval_results.get("total_params", 1), 1),
+            "total_params": total_params,
+            "active_params": active_params,
+            "active_params_ratio": active_params / max(total_params, 1),
             "training_time": training_time,
-            "experiment_type": "_".join(sorted([axis for axis in experiment.keys()])), # Sort axes for consistency
         }
 
-        # Add specific configuration details and benchmark results
-        for axis, config in experiment.items():
-            if axis == "data_mix":
-                result["data_config"] = config["name"]
-            elif axis == "expert_setup":
-                result["expert_setup_config"] = config["name"]
-            elif axis == "selection_heads":
-                result["selection_config"] = config["name"]
+        # Add experiment-specific metadata
+        if ablation_type == "capacity_sweep":
+            result["target_params"] = experiment.get("target_params", 0)
+            result["num_experts"] = experiment.get("num_experts", 0)
+            result["is_dense"] = not experiment.get("use_peer", True)
+        elif ablation_type == "granularity_sweep":
+            result["expert_size_kb"] = experiment.get("expert_size_kb", 0)
+            result["num_experts"] = experiment.get("num_experts", 0)
+            result["num_experts_per_tok"] = experiment.get("num_experts_per_tok", 0)
+        elif ablation_type == "compute_tradeoff":
+            result["target_params"] = experiment.get("target_params", 0)
+            result["training_tokens"] = experiment.get("training_tokens", 0)
+        elif ablation_type in ["activation_4b", "activation_256b"]:
+            result["activation_percentage"] = experiment.get("activation_percentage", 0)
+            result["num_experts"] = experiment.get("num_experts", 0)
 
         # Add benchmark results directly from eval_results
         for key, value in eval_results.items():
