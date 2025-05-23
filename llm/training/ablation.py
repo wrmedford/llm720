@@ -386,7 +386,7 @@ def create_experiment_folder(output_dir: str) -> str:
     return experiment_dir
 
 
-def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ablation_type: str) -> Tuple[str, str]:
+def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ablation_type: str, gpu_count: int = 1) -> Tuple[str, str]:
     """
     Generate a configuration file for a specific experiment.
 
@@ -395,6 +395,7 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ab
         experiment: Experiment-specific configuration dictionary
         experiment_dir: Path to experiment directory
         ablation_type: Type of ablation being run
+        gpu_count: Number of GPUs to use for training
 
     Returns:
         Tuple of (config_path, experiment_name)
@@ -419,9 +420,11 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ab
         config["model_config"]["mla_config"]["q_lora_rank"] = model_size["hidden_size"] * 2
         config["model_config"]["mla_config"]["kv_lora_rank"] = model_size["hidden_size"] // 2
         
-        if experiment["use_peer"]:
+        # Set use_peer based on experiment configuration
+        config["model_config"]["use_peer"] = experiment.get("use_peer", True)
+        
+        if config["model_config"]["use_peer"]:
             # PEER configuration
-            config["model_config"]["use_peer"] = True
             config["model_config"]["peer_start_layer"] = 2
             config["model_config"]["peer_config"]["num_experts"] = experiment["num_experts"]
             config["model_config"]["peer_config"]["num_experts_per_tok"] = 2048  # C_act = 2048
@@ -438,9 +441,8 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ab
             else:
                 config["model_config"]["peer_config"]["product_key_dim"] = [2048, 2048]
         else:
-            # Dense baseline - set peer_start_layer >= num_hidden_layers
-            config["model_config"]["use_peer"] = True  # Keep True but disable via layer index
-            config["model_config"]["peer_start_layer"] = config["model_config"]["num_hidden_layers"]
+            # Dense baseline - explicitly set use_peer to False
+            # No need for additional configuration since PEER is disabled
             
     elif ablation_type == "granularity_sweep":
         # Ablation 2: Expert-Granularity Sweep
@@ -495,10 +497,15 @@ def generate_config(base_config: Dict, experiment: Dict, experiment_dir: str, ab
         expert_hidden_size = calculate_expert_hidden_size(EXPERT_SIZE_BYTES, model_size["hidden_size"])
         config["model_config"]["peer_config"]["expert_hidden_size"] = expert_hidden_size
         
-        # Set training tokens
-        config["train_config"]["max_steps"] = int(experiment["training_tokens"] / 
-                                                  (config["train_config"]["per_device_train_batch_size"] * 
-                                                   config["dataset_config"]["max_seq_length"]))
+        # Set training tokens - calculate max_steps with gpu_count and gradient accumulation
+        grad_accum_steps = config["train_config"].get("gradient_accumulation_steps", 1)
+        global_batch_size = config["train_config"]["per_device_train_batch_size"] * gpu_count * grad_accum_steps
+        tokens_per_step = global_batch_size * config["dataset_config"]["max_seq_length"]
+        
+        if tokens_per_step > 0:
+            config["train_config"]["max_steps"] = int(experiment["training_tokens"] / tokens_per_step)
+        else:
+            raise ValueError(f"Invalid tokens_per_step: {tokens_per_step}")
         
     elif ablation_type in ["activation_4b", "activation_256b"]:
         # Ablations 4 & 5: Activation Sweeps
@@ -1433,7 +1440,7 @@ def run_ablation_study(
 
         # Generate configuration for this experiment
         config_path, experiment_name = generate_config(
-            base_config, experiment, experiment_dir, ablation_type
+            base_config, experiment, experiment_dir, ablation_type, gpu_count
         )
 
         # Run training
