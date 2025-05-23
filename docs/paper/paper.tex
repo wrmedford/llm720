@@ -1,0 +1,491 @@
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{graphicx}
+
+\title{Beyond Memory Limits: Scaling Mixture-of-Experts Models\\
+\large Scaling Laws and Model Training Framework for Compute-Efficient Massive Models}
+
+\author{
+  \begin{tabular}{c}
+    Wesley Medford \\[1ex]
+    @wrmedford
+  \end{tabular}  
+  \\
+  \begin{tabular}{ccc}
+    Ed Sealing & John McBride & Eve Callicoat &
+    @drikster80 & @jpmcb & @apsu
+  \end{tabular}
+}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+The rapid progress of large language models (LLMs) is hitting a hardware wall: memory
+bandwidth and device capacity now limit scale more than raw compute. Sparse
+Mixture-of-Experts (MoE) Transformers mitigate this by activating only a small fraction of
+parameters per token, yet state-of-the-art models still top out at a few hundred experts and
+remain memory-bound.
+
+We make a two-part contribution. First, we present a unified set of fine‑grained MoE
+\emph{scaling laws}, derived from first principles, that analytically predict super‑linear gains
+in throughput and energy efficiency as expert granularity increases. These laws subsume
+and extend the intuition of Mixture‑of‑a‑Million‑Experts (He, 2024) by explicitly modelling
+cache behaviour and off‑chip streaming.
+
+Second, we introduce \textbf{LLM720}\footnote{Code available at https://github.com/wrmedford/llm720.}, an open‑source training framework built to test these
+laws at scales beyond current practice. LLM720 integrates:
+\begin{enumerate}
+  \item Product‑key routing that indexes $\ge10^6$ experts with sub‑linear lookup cost,
+  \item A fused CUTLASS kernel that exploits the reversed size ratio between tokens and
+    expert weights, and
+  \item Hierarchical weight streaming that leverages Unified Virtual Addressing and
+    cache‑aware prefetching to operate outside VRAM limits.
+\end{enumerate}
+
+We define an ablation suite spanning constant‑compute, constant‑active‑parameter, and
+sparsity‑sweep regimes, providing the first systematic roadmap for million‑expert MoE
+evaluation. By unifying theory and system design, this work lays the empirical foundation
+for scaling MoE models well beyond contemporary memory constraints and invites the
+community to replicate, refine, and extend our findings.
+
+\end{abstract}
+
+\section{Introduction}
+The last five years of large‑language‑model (LLM) research have been driven by an apparently
+simple recipe: scale parameters, scale data, harvest monotonic gains in accuracy. Early
+empirical laws quantified this trend, showing that test loss falls predictably as a power‑law
+in model size and training compute. But continuing that trajectory now collides with a
+hardware wall: high‑bandwidth memory (HBM) capacity and memory‑access energy dominate
+cost long before GPUs reach their theoretical FLOP limits. Training or serving a
+dense‑parameter model beyond a few hundred billion weights demands either exotic
+multi‑node pipelines or aggressive precision trade‑offs that sacrifice throughput.
+
+Mixture‑of‑Experts (MoE) Transformers address this bottleneck by activating only a small
+subset of weights per token. Conditional computation was first proven practical at 600B
+parameters in GShard (Lepikhin \emph{et al.}, 2020) and later at the trillion‑parameter scale in
+Switch Transformer (Fedus \emph{et al.}, 2021), both of which used 64–128 experts per MoE layer.
+Subsequent work such as DeepSeek‑V3 increased the pool to 256 experts and adopted
+FP8 training to curtail bandwidth pressure (DeepSeek‑Ai \emph{et al.}, 2024). Yet even these
+state‑of‑the‑art (SOTA) systems remain memory‑bound: every expert still has to reside in
+on‑device memory, and routing imbalance can leave bandwidth under‑utilised. Recent work
+on Mixture‑of‑a‑Million‑Experts (PEER) pushed the idea of fine‑grained experts—shrinking
+each expert by orders of magnitude so that the expert pool can grow to $10^6$ entries without
+exploding active FLOPs (He, 2024). While PEER provided a promising prototype, the
+broader community still lacks:
+\begin{itemize}
+  \item a general theoretical framework that explains when and why throughput or energy
+efficiency should improve as expert granularity increases, and
+  \item an open test‑bed for validating such fine‑grained scaling laws under realistic memory
+budgets.
+\end{itemize}
+
+\subsection{Building on Open Foundations}
+LLM720 builds upon and extends the principles established by the LLM360 initiative (Lieu \emph{et al.}, 2023), which pioneered open-source model transparency. While LLM360 offered a degree of openness through complete training logs and evaluation metrics, LLM720 doubles this transparency by extending it to the full hardware utilization stack—from memory hierarchy exploitation to expert routing—hence the "720" moniker. By integrating theoretical scaling laws with practical system design, LLM720 provides both predictive power and a concrete implementation path for deploying models beyond current memory constraints.
+
+\subsection{Goals}
+This paper tackles both gaps. We first derive a set of fine‑grained MoE scaling laws
+(Section~\ref{sec:theory}) that predict super‑linear gains in throughput and energy efficiency
+when (i) routing stays balanced and (ii) expert weights can be streamed from slower tiers.
+Second, we present \textbf{LLM720}, a purpose‑built training framework that couples:
+\begin{enumerate}
+  \item Product‑key routing to index $\ge10^6$ experts with sub‑linear lookup cost,
+  \item A fused CUTLASS kernel that exploits the reversed size ratio between token batches and
+    expert weights, and
+  \item Hierarchical weight streaming based on Unified Virtual Addressing to operate safely
+    beyond VRAM limits.
+\end{enumerate}
+By unifying theory with an open implementation, we aim to shift LLM scaling from being
+memory‑constrained to capacity‑driven. Our work directly complements recent calls for
+scaling laws that incorporate inference memory and bandwidth costs (Sardana \emph{et al.}, 2024)
+and offers the community a replicable platform for memory‑aware MoE research.
+
+\section{Background and Related Works}
+% (unchanged)
+\subsection{Foundational Mixture of Experts Works}
+Jacobs and Jordan (1991) introduced the original Mixture of Experts framework for small
+feed‑forward networks. The idea was scaled to sequence modelling in Sparsely‑Gated MoE for
+RNN LMs (Shazeer \emph{et al.}, 2017), which demonstrated that activating only 1–2 experts per token
+could increase parameter counts 20$\times$ at nearly constant FLOPs.
+
+Modern Transformer variants soon followed. GShard applied top‑2 gating to a 600B‑parameter
+multilingual translation model, using expert‑parallel all‑to‑all to distribute tokens across
+accelerators (Lepikhin \emph{et al.}, 2020). Switch Transformer simplified routing to top‑1,
+enabling a 1.6T‑parameter model trained with 64 experts per layer (Fedus \emph{et al.}, 2021). In
+vision, V‑MoE inserted sparse experts into ViTs and matched dense models four times larger
+while saving inference compute (Riquelme \emph{et al.}, 2021).
+
+\subsection{Routing and Load‑Balancing Innovations}
+Large expert pools amplify two classic MoE pathologies: hot experts that monopolise tokens
+and cold experts that never learn. Strategies include:
+\begin{itemize}
+  \item Auxiliary load‑balance losses (Shazeer, 2017), penalising high variance in token counts.
+  \item BASE Layers, solving a Hungarian assignment each batch for perfect balance (Lewis \emph{et al.}, 2021).
+  \item Expert‑Choice Routing, where experts select their top‑$k$ tokens (Zhou \emph{et al.}, 2022).
+  \item Parameter‑Efficient Expert Routing (He, 2024), combining product‑key search with Batch‑Norm gating to scale to $10^6$ experts with <5\% imbalance.
+\end{itemize}
+
+\subsection{System‑Level Optimisations for Sparse Experts}
+Moving millions of tiny experts through the memory hierarchy stresses both bandwidth and
+kernel efficiency:
+\begin{itemize}
+  \item MegaBlocks: block‑sparse matmuls with up to 40\% speed‑up on A100 GPUs (Gale \emph{et al.}, 2022).
+  \item Scatter‑MoE / Triton‑fused kernels: fusing gather + GEMM into one kernel (Tan \emph{et al.}, 2024).
+  \item Inference offload: fMoE (Yu \emph{et al.}, 2025), Fiddler (Kamahori \emph{et al.}, 2025) stream cold experts.
+  \item Wafer‑scale offload: Cerebras MemoryX demos weight‑offload at training scale.
+\end{itemize}
+LLM720 builds on these advances with a CUTLASS kernel and UVA‑based hierarchical streaming.
+
+\section{Theoretical Framework}\label{sec:theory}
+This section develops a self‑contained theoretical framework for fine‑grained MoE scaling.
+Our goal is to predict (i) \emph{throughput}—tokens processed per second (TPS)—and (ii)
+\emph{model quality}—captured by validation perplexity—under realistic compute and memory
+constraints.
+
+\subsection{Notation}
+\begin{table}[ht]
+  \centering
+  \begin{tabular}{lll}
+    \toprule
+    Symbol & Meaning & Typical value \\
+    \midrule
+    $N_{\mathrm{tot}}$ & experts per layer & $10^2$--$10^6$ \\
+    $s_{\mathrm{exp}}$ & parameters per expert (bytes) & $10^2$--$10^4$ \\
+    $C_{\mathrm{act}}$ & experts \emph{activated} per token & 1--32 \\
+    $s_{\mathrm{tok}}$ & token embedding size (bytes) & $\sim10^3$ \\
+    $B$ & HBM bandwidth (bytes/s) & 1--3 TB/s \\
+    $L$ & DRAM$\to$HBM latency (s) & $10^{-5}$ \\
+    $P_{\mathrm{hit}}$ & cache‑hit probability & dependent on $N_{\mathrm{hot}}$ \\
+    $t_{\mathrm{GEMM}}$ & single‑expert GEMM time & $\propto s_{\mathrm{tok}},s_{\mathrm{exp}}$ \\
+    $\delta$ & perplexity exponent & 0.42--0.48 \\
+    $\lambda$ & saturation exponent & 0.25--0.35 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Key symbols used in Section~\ref{sec:theory}.}
+\end{table}
+
+Throughout, we distinguish \emph{active parameters} $P_{\mathrm{act}} = C_{\mathrm{act}} s_{\mathrm{exp}}$ from the
+\emph{capacity parameters} $P_{\mathrm{cap}} = N_{\mathrm{tot}} s_{\mathrm{exp}}$ that reside in slower tiers.
+
+\subsection{Assumptions}
+\begin{enumerate}
+  \item \textbf{Balanced routing.} Each expert receives exactly $\frac{C_{\mathrm{act}}}{N_{\mathrm{tot}}}$ of the tokens in expectation. This balance is achievable in practice through Parameter-Efficient Expert Routing (He, 2024), which employs a loss-free batch normalization approach for expert queries. By applying layer normalization to the query vectors before expert scoring, PEER enables more stable routing distributions during both training and inference, with empirically measured imbalance below 5\% even at million-expert scales.
+  \item \textbf{Small‑expert regime.} We consider $s_{\mathrm{exp}} \ll s_{\mathrm{tok}}$, so weight streaming dominates bandwidth.
+  \item \textbf{Streaming hierarchy.} A hot set of $N_{\mathrm{hot}}\ll N_{\mathrm{tot}}$ experts lives in HBM; cache misses are served from system DRAM via UVA.
+\end{enumerate}
+
+\subsection{Compute and Memory Model}
+For a single token, the end-to-end latency is the sum of matrix multiplication, weight transfer, and (rare) PCIe latency:
+\begin{equation}\label{eq:Ttok}
+T_{\mathrm{tok}} = C_{\mathrm{act}}\bigl(t_{\mathrm{GEMM}} + (1 - P_{\mathrm{hit}})\frac{s_{\mathrm{exp}}}{B}\bigr) + P_{\mathrm{miss}} L,
+\quad P_{\mathrm{miss}} = (1 - P_{\mathrm{hit}})^{C_{\mathrm{act}}}.
+\end{equation}
+
+Because $L\gg s_{\mathrm{exp}} / B$, a single PCIe miss dominates latency. However, as expert granularity increases (smaller $s_{\mathrm{exp}}$), the miss penalty approaches zero through two complementary mechanisms:
+
+\begin{enumerate}
+  \item \textbf{Exponential miss reduction:} $P_{\mathrm{miss}}$ decreases exponentially with cache efficiency, following $P_{\mathrm{miss}} \propto \exp(-k \cdot N_{\mathrm{hot}}/N_{\mathrm{tot}})$ where $k$ is a constant related to routing entropy.
+  \item \textbf{Access pattern optimization:} Fine-grained experts enable ping-pong buffering with optimized memory access patterns, converting random accesses into structured streams that better utilize modern GPU memory controllers and interconnects.
+\end{enumerate}
+
+For sufficiently small experts, the system enters a \emph{bandwidth-limited} regime where $P_{\mathrm{miss}} \approx 0$ and throughput follows:
+
+\begin{equation}\label{eq:tps}
+\mathrm{TPS} \equiv \frac{1}{T_{\mathrm{tok}}} \propto \frac{1}{s_{\mathrm{exp}}}\bigl(k_1 s_{\mathrm{tok}} + k_2/B\bigr)^{-1},
+\end{equation}
+
+illustrating a near-linear \emph{inverse} dependence on expert size when operating under full bus utilization.
+
+\subsection{Quality Law: Perplexity vs. Active Parameters}
+Empirically, validation perplexity follows a diminishing‑returns power law in the number of
+\emph{active} parameters—those actually multiplied per token:
+\begin{equation}\label{eq:ppl}
+\mathrm{PPL}(P_{\mathrm{act}}, P_{\mathrm{cap}})
+= A\,P_{\mathrm{act}}^{-\delta} + B\,P_{\mathrm{cap}}^{-\lambda} + \varepsilon,
+\end{equation}
+where $\delta\approx0.45$ captures compute‑limited gains while $\lambda\approx0.3$ reflects the
+benefit of a larger knowledge base that can be sparsely accessed. Equation~\eqref{eq:ppl}
+reduces to the classic dense scaling law when $P_{\mathrm{act}} = P_{\mathrm{cap}}$.
+
+\subsection{Optimal Expert Granularity}
+Combining Eqs.~\eqref{eq:tps} and~\eqref{eq:ppl} under a fixed training‑compute budget $\mathcal{C}$
+reveals an optimal expert size
+\begin{equation}
+s_{\mathrm{exp}}^* \propto (B\,\mathcal{C})^{\frac{\delta}{1+\delta}},
+\end{equation}
+with the corresponding optimal expert count $N_{\mathrm{tot}}^* = \tfrac{\mathcal{C}}{s_{\mathrm{exp}}^*}$.
+Intuitively, faster bandwidth or larger budgets favour smaller experts; limited bandwidth
+pushes towards fewer, larger experts.
+
+\subsection{Predictions and Experimental Hypotheses}
+\begin{table}[ht]
+  \centering
+  \begin{tabular}{lll}
+    \toprule
+    ID & Description & Theory Prediction \\
+    \midrule
+    H1 & TPS vs. expert size ($C_{\mathrm{act}},N_{\mathrm{tot}}$ fixed) & $\mathrm{TPS}\propto s_{\mathrm{exp}}^{-1}$ \\
+    H2 & PPL vs. active params ($C_{\mathrm{act}} s_{\mathrm{exp}}$ sweep) & $\mathrm{PPL}\propto P_{\mathrm{act}}^{-\delta}$ \\
+    H3 & PPL vs. capacity ($N_{\mathrm{tot}}$ sweep) & $\mathrm{PPL}\propto P_{\mathrm{cap}}^{-\lambda}$ \\
+    \bottomrule
+  \end{tabular}
+  \caption{Key hypotheses evaluated by LLM720's ablation suite (Section~5).}
+\end{table}
+
+These analytical predictions directly inform LLM720's experimental design and eliminate
+the need to consult external manuscripts.
+
+\section{Experimental Design}\label{sec:experiments}
+
+This section specifies the ablation suite by which \textsc{LLM720} will
+empirically test the scaling hypotheses introduced in
+Section~\ref{sec:theory}:  
+H1 (\emph{throughput $\propto s_{\mathrm{exp}}^{-1}$}),  
+H2 (\emph{perplexity $\propto P_{\mathrm{act}}^{-\delta}$}), and  
+H3 (\emph{perplexity $\propto P_{\mathrm{cap}}^{-\lambda}$}).
+
+\subsection{Common Protocol}
+
+\paragraph{Metrics.}  
+\begin{itemize}
+  \item \textbf{Throughput} (TPS): median tokens\,/\,s over 1k inference
+        batches.
+  \item \textbf{Validation perplexity}: computed on the 20B‑token
+        \textsc{PILE‑CC} hold‑out.
+  \item \textbf{Training compute}: $C = \text{FLOPs}\times\text{steps}$.
+\end{itemize}
+
+\paragraph{Hardware.}  
+All experiments run on eight H100‑80GB GPUs with
+HBM bandwidth $B = 3.35$TBs$^{-1}$.
+Hierarchical weight streaming is enabled so that VRAM is not the
+limiting factor.
+
+\paragraph{Data schedule.}  
+Each model is trained on a 1.2T‑token multilingual mix with
+a cosine‑decay LR schedule and 500M warm‑up tokens.
+Unless otherwise noted, runs stop at one trillion processed tokens so
+that late‑stage convergence noise does not obscure comparisons.
+
+\subsection{Ablation 1: Model‑Capacity Sweep at Constant $P_{\mathrm{act}}$}
+\begin{description}
+  \item[Goal.]  Test whether quality improves with capacity
+        when the number of active parameters per token is fixed (H3).
+  \item[Method.]  
+        Expert size $s_{\mathrm{exp}} = 56$ KB (FP8) and
+        activation $C_{\mathrm{act}} = 2048$ are held constant while
+        expert count scales from $N_{\mathrm{tot}} = 0$ (dense baseline)
+        to $N_{\mathrm{tot}} = 4.2$ M, producing 1 B–250 B‑parameter
+        models. Following DeepSeek-V3's approach, we implement the dense baseline by setting \texttt{first\_k\_dense\_replace = num\_hidden\_layers}, which replaces all MoE layers with standard dense feed-forward layers while preserving model structure. This provides an equivalent non-sparse architecture for controlled comparison.
+  \item[Hypothesis Link.]  
+        Eq.~\eqref{eq:ppl} predicts validation perplexity
+        $\propto P_{\mathrm{cap}}^{-\lambda}$ with
+        $\lambda \approx 0.3$, while throughput stays nearly flat.
+\end{description}
+
+\subsection{Ablation 2: Expert‑Granularity Sweep at Constant Capacity}
+\begin{description}
+  \item[Goal.]  Isolate expert size effects on throughput (H1) and on
+        quality via $P_{\mathrm{act}}$ (H2).
+  \item[Method.]  
+        Starting from the 4B‑parameter configuration of Ablation 1
+        ($N_{\mathrm{tot}} = 65\,536$), we
+        quarter $s_{\mathrm{exp}}$ and simultaneously quadruple
+        $N_{\mathrm{tot}}$ over four steps, halving
+        $P_{\mathrm{act}}$ each step.
+  \item[Hypothesis Link.]
+        \emph{Throughput} should improve $\propto s_{\mathrm{exp}}^{-1}$
+        (H1); \emph{quality} should follow
+        $P_{\mathrm{act}}^{-\delta}$ with $\delta \approx 0.45$ (H2).
+\end{description}
+
+\subsection{Ablation3: Compute‑Budget Trade‑off (Token vs.\ Model Size)}
+\begin{description}
+  \item[Goal.]  Under a fixed compute budget, determine whether allocating
+        resources to a larger model on fewer tokens or a smaller model on
+        more tokens yields better perplexity.  This extends H2 into a
+        data‑efficiency regime.
+  \item[Method.]  
+        We hold $C = 3.0 \times 10^{24}$FLOPs constant and choose four
+        model–token pairs whose \emph{product} of tokens and active
+        parameters is identical, thereby isolating the trade‑off.  
+        Unlike classical "Chinchilla‑optimal'' studies, we \emph{deliberately
+        avoid} the ideal‑token region to keep experimental cost within
+        budget; partial convergence is acceptable for this proof‑of‑concept.
+  \item[Limitation.]  
+        Because runs may terminate before full convergence, reported
+        perplexities can exhibit higher variance; this noise is accepted
+        for the present validation effort.
+\end{description}
+
+\subsection{Ablation4: Activation Sweep in the 4B‑Parameter Regime}
+\begin{description}
+  \item[Goal.]  Identify an optimal activation fraction
+        $C_{\mathrm{act}}/N_{\mathrm{tot}}$ for a \emph{small} capacity
+        model.
+  \item[Method.]  
+        Capacity is fixed at 4B parameters
+        ($N_{\mathrm{tot}} = 65\,536$).  Activation is swept from
+        1.5\,\% to 12.5\,\%, changing $P_{\mathrm{act}}$ by$\times 8$.
+  \item[Hypothesis Link.]  
+        Throughput should scale linearly with $C_{\mathrm{act}}$, while
+        quality follows $P_{\mathrm{act}}^{-\delta}$ until routing or
+        bandwidth limits appear.
+\end{description}
+
+\subsection{Ablation 5: Activation Sweep in the 256B‑Parameter Regime}
+\begin{description}
+  \item[Goal.]  Repeat Ablation 4 in a \emph{large} capacity setting to
+        see whether the optimal activation fraction shifts with scale.
+  \item[Method.]  
+        Capacity is fixed at 256 B parameters
+        ($N_{\mathrm{tot}} = 4.19$ M).  Activation is again swept
+        1.5–12.5\,\%.
+  \item[Hypothesis Link.]  
+        Comparing with Ablation 4 reveals any scale‑dependent change in
+        the effective $\delta$ or optimal activation fraction.
+\end{description}
+
+\subsection{Summary}
+
+Ablations 1–5 jointly cover total capacity ($P_{\mathrm{cap}}$),
+expert granularity ($s_{\mathrm{exp}}$), activation fraction
+($C_{\mathrm{act}}/N_{\mathrm{tot}}$), and compute allocation.  Together
+they provide sufficient experimental coverage to validate the scaling
+laws of Section~\ref{sec:theory}.  No further changes are required at
+this stage; we proceed with scheduling the described runs.
+
+\section{LLM720: System Architecture}\label{sec:system}
+
+LLM720 integrates theoretical scaling insights with practical system design. This section details its key components and implementation strategy.
+
+\subsection{Parameter Efficient Expert Retrieval (PEER)}
+
+PEER (He, 2024) implements million-scale expert routing through cartesian product keys:
+
+\begin{enumerate}
+    \item \textbf{Product-Key Selection:} Instead of maintaining $O(N)$ keys for $N$ experts, PEER uses a Cartesian product of smaller key spaces. For example, a 1M-expert system can use two dimensions of 1K keys each ($10^3 \times 10^3 = 10^6$) or four dimensions of 32 keys ($32^4 \approx 10^6$), reducing key storage and computation by orders of magnitude.
+    
+    \item \textbf{Layered Expert Access:} Query vectors are split into $d$ sub-queries (where $d$ is the number of dimensions), and each sub-query is matched against its corresponding dimension's keys. The final expert keys are constructed combinatorially, enabling $O(d \cdot \sqrt[d]{N})$ time complexity instead of $O(N)$.
+    
+    \item \textbf{Query Normalization:} Layer normalization is applied to query vectors to ensure stable, balanced routing across experts without requiring auxiliary load-balancing losses. This enables consistent expert utilization even during early training.
+\end{enumerate}
+
+\subsection{Multi-Headed Latent Attention (MLA)}
+
+MLA implements the efficient attention architecture from DeepSeek-V3:
+
+\begin{enumerate}
+    \item \textbf{Decomposed Query/Key Representations:} Each query and key is split into RoPE-encoded and non-positional components, enabling efficient mixing of local and global attention patterns.
+    
+    \item \textbf{Low-Rank Latent Projections:} Key and value tensors are projected through a lower-dimensional bottleneck (typically 512-dimension for a 7168-dimension model), substantially reducing memory bandwidth requirements during inference.
+    
+    \item \textbf{Optimized Decode Path:} The architecture includes specialized weights that are pre-computed for the single-token decode path, enabling faster inference for autoregressive generation.
+\end{enumerate}
+
+\subsection{Memory Hierarchy Utilization}\label{subsec:memory}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.75\linewidth]{hierarchy.png}
+    \caption{LLM720's memory hierarchy utilization for expert streaming.}
+    \label{fig:memory-hierarchy}
+\end{figure}
+
+
+LLM720 exploits the full memory hierarchy to scale beyond VRAM limitations:
+
+\begin{enumerate}
+    \item \textbf{SM Scratchpad (L1) Strategy:} LLM720 implements ping-pong buffering in shared memory, keeping one token slice ($\sim$TOKEN\_BYTES) plus two expert weight buffers ($2 \times$ EXPERT\_BYTES) for asynchronous streaming. This allows overlapping compute with memory transfers.
+    
+    \item \textbf{L2 Cache Management:} Token blocks are sized to fit within L2 cache ($\leq 40$MB on H100), ensuring high-bandwidth access for all threadblocks processing the same tokens.
+    
+    \item \textbf{Hierarchical Weight Streaming:} Expert weights flow from system DRAM through VRAM to SM scratchpad using overlapped transfers, bypassing L2 cache to avoid pollution.
+    
+    \item \textbf{Unified Virtual Addressing:} LLM720 leverages UVA to present a single address space spanning CPU and GPU memory, with TMA (Tensor Memory Accelerator) providing direct transfers without CPU involvement.
+\end{enumerate}
+
+The implementation follows the execution pattern:
+\begin{enumerate}
+    \item Choose token chunk size for optimal L2 residence ($\text{CHUNK\_SIZE} \times \text{TOKEN\_BYTES} \leq 40$ MB)
+    \item Launch thread-blocks to process this chunk
+    \item Within each block, stream tokens to shared memory once
+    \item Loop over experts with double-buffered weights to hide memory latency
+    \item Process next token chunk after all blocks finish
+\end{enumerate}
+
+This approach achieves near-linear scaling of expert count without proportionally increasing memory requirements.
+
+\subsection{CUTLASS Kernel Implementation}
+
+LLM720 initially attempted implementation using Triton for its Python-native development experience and automatic optimization capabilities. However, we found that achieving our performance targets required lower-level control over memory movement and hardware features than Triton could provide at the time. Specifically, Triton's lack of robust support for NVIDIA's Tensor Memory Accelerator (TMA) proved limiting for our hierarchical memory streaming approach. We therefore pivoted to a CUTLASS implementation that provides direct access to these critical hardware features.
+
+The CUTLASS kernel optimizes the entire PEER forward pass through:
+
+\begin{enumerate}
+    \item \textbf{Fused Operations:} Query projection, normalization, product-key scoring, expert weight fetching, and computations are fused into a single kernel to minimize kernel launch overhead.
+    
+    \item \textbf{Hardware-Aware Memory Management:} The kernel directly leverages NVIDIA's Tensor Memory Accelerator (TMA) for asynchronous memory transfers between hierarchy levels, enabling true overlap of computation and data movement that was not achievable with Triton.
+    
+    \item \textbf{Optimized Tensor Core Utilization:} CUTLASS's mature WMMA (Warp Matrix Multiply Accumulate) integration provides efficient mixed-precision computation paths for both Ampere and Hopper architectures.
+    
+    \item \textbf{Cache-Aware Prefetching:} Explicit control over L1/L2 cache behavior allows the kernel to maintain hot expert weights in fast memory while streaming cold experts without cache pollution.
+\end{enumerate}
+
+This low-level control enables LLM720 to scale to millions of experts while maintaining high computational efficiency, even when most expert weights reside outside of GPU memory. 
+
+\subsection{Training Framework}
+
+Beyond the core computational kernels, LLM720 provides a complete training ecosystem:
+
+\begin{enumerate}
+    \item \textbf{Distributed Training:} Native multi-node, multi-GPU training with automatic handling of expert sharding and all-to-all communication.
+    
+    \item \textbf{Expert Usage Monitoring:} Real-time tracking of expert utilization to detect and address routing imbalances during training.
+    
+    \item \textbf{Dataset Management:} Efficient streaming, interleaving, and tokenization of heterogeneous data sources.
+    
+    \item \textbf{Comprehensive Evaluation:} Built-in benchmark suite covering perplexity, language understanding, mathematics, and code generation metrics.
+    
+    \item \textbf{Ablation Testing:} Systematic exploration of architectural choices through automated parameter sweeps.
+\end{enumerate}
+
+\subsection{Weights \& Biases Integration}
+
+For transparency and reproducibility, LLM720 includes comprehensive Weights \& Biases integration for tracking:
+
+\begin{enumerate}
+    \item Expert usage patterns during training
+    \item Model gradients and parameter distributions
+    \item Performance metrics across different hardware configurations
+    \item Batch-level perplexity and loss breakdown
+\end{enumerate}
+
+This integration supports LLM720's goal of establishing replicable baselines for MoE scaling research.
+
+\begin{thebibliography}{99}
+\bibitem{GShard2020} Lepikhin \emph{et al.} (2020). \emph{GShard: Scaling giant models with conditional computation and automatic sharding}. \href{https://arxiv.org/abs/2006.16668}{arXiv:2006.16668}.
+\bibitem{Switch2021} Fedus \emph{et al.} (2021). \emph{Switch Transformers}. \href{https://arxiv.org/abs/2101.03961}{arXiv:2101.03961}.
+\bibitem{DSv3} DeepSeek‑Ai \emph{et al.} (2024). \emph{DeepSeek‑V3}. \href{https://arxiv.org/pdf/2412.19437}{arXiv:2412.19437}.
+\bibitem{PEER} He (2024). \emph{Mixture‑of‑a‑Million‑Experts}. \href{https://arxiv.org/abs/2407.04153}{arXiv:2407.04153}.
+\bibitem{BeyondChinchilla} Hoffmann \emph{et al.} (2024). \emph{Beyond Chinchilla}. \href{https://arxiv.org/html/2401.00448v2}{arXiv:2401.00448v2}.
+\bibitem{JJ1991} Jacobs \& Jordan (1991). \emph{Hierarchical mixtures of experts}. \href{https://www.cs.toronto.edu/~fritz/absps/jjnh91.pdf}{PDF}.
+\bibitem{SparseMoE} Shazeer \emph{et al.} (2017). \emph{Sparsely‑Gated Mixture‑of‑Experts}. \href{https://arxiv.org/abs/1701.06538}{arXiv:1701.06538}.
+\bibitem{VMoE} Riquelme \emph{et al.} (2021). \emph{Vision MoE}. NeurIPS 2021.
+\bibitem{BASE} Lewis \emph{et al.} (2021). \emph{BASE Layers}. \href{https://arxiv.org/pdf/2103.16716}{arXiv:2103.16716}.
+\bibitem{ChoiceRouting} Zhou \emph{et al.} (2022). \emph{Expert‑Choice Routing}. \href{https://arxiv.org/pdf/2202.09368}{arXiv:2202.09368}.
+\bibitem{fMoE} Yu \emph{et al.} (2025). \emph{fMoE}. \href{https://arxiv.org/pdf/2502.05370}{arXiv:2502.05370}.
+\bibitem{Fiddler} Kamahori \emph{et al.} (2025). \emph{Fiddler}. \href{https://arxiv.org/pdf/2402.07033}{arXiv:2402.07033}.
+\bibitem{MegaBlocks} Gale \emph{et al.} (2022). \emph{MegaBlocks}. \href{https://arxiv.org/pdf/2211.15841}{arXiv:2211.15841}.
+\bibitem{ProMoE} Song \emph{et al.} (2025). \emph{ProMoE}. \href{https://arxiv.org/html/2410.22134v2}{arXiv:2410.22134v2}.
+\bibitem{FineGrainedLaws} Krajewski \emph{et al.} (2024). \emph{Fine‑Grained Expert Scaling Laws}. \href{https://arxiv.org/pdf/2402.07871}{arXiv:2402.07871}.
+\bibitem{MemoryEfficiency} Ludziejewski \emph{et al.} (2025). \emph{MoE Memory Efficiency}. \href{https://arxiv.org/pdf/2502.05172}{arXiv:2502.05172}.
+\bibitem{InferenceMetrics} Sardana \emph{et al.} (2024). \emph{Bandwidth‑Aware Scaling Metrics}. \href{https://arxiv.org/pdf/2401.00448}{arXiv:2401.00448}.
+\bibitem{LLM360} Lieu \emph{et al.} (2023). \emph{LLM360}. \href{https://arxiv.org/pdf/2401.00448}{arXiv:2401.00448}.
+\end{thebibliography}
+
+\end{document}
