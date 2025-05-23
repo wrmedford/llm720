@@ -31,22 +31,26 @@ def test_weight_synchronization():
     # Create input tensors
     x = torch.randn(batch_size, seq_len, input_dim, device=device, dtype=torch.float16)
     
-    # Create weight tensors with known patterns
-    query_weight = torch.randn(num_heads, input_dim, query_dim, device=device, dtype=torch.float16)
-    query_bias = torch.randn(num_heads, query_dim, device=device, dtype=torch.float16)
-    key_weight_1 = torch.randn(num_heads, input_dim, int(num_experts**0.5), device=device, dtype=torch.float16)
-    key_weight_2 = torch.randn(num_heads, input_dim, int(num_experts**0.5), device=device, dtype=torch.float16)
+    # Create weight tensors matching what PEER model actually passes
+    # Query weight from nn.Linear: [num_heads * query_dim, input_dim]
+    query_weight = torch.randn(num_heads * query_dim, input_dim, device=device, dtype=torch.float16)
+    # Query bias is optional but if present: [num_heads * query_dim]
+    query_bias = torch.randn(num_heads * query_dim, device=device, dtype=torch.float16)
+    # Sub-keys from ParameterList: [sqrt(num_experts), sub_key_dim] where sub_key_dim = query_dim / num_dims
+    sub_key_dim = query_dim // 2  # Assuming 2 dimensions for product keys
+    key_weight_1 = torch.randn(int(num_experts**0.5), sub_key_dim, device=device, dtype=torch.float16)
+    key_weight_2 = torch.randn(int(num_experts**0.5), sub_key_dim, device=device, dtype=torch.float16)
     
     # Create expert weights with specific patterns to verify they're being used
-    # U weights: [num_experts, input_dim, expert_hidden_size]
-    expert_weights_u = torch.zeros(num_experts, input_dim, expert_hidden_size, device=device, dtype=torch.float16)
-    # V weights: [num_experts, expert_hidden_size, output_dim]
-    expert_weights_v = torch.zeros(num_experts, expert_hidden_size, output_dim, device=device, dtype=torch.float16)
+    # U weights: [num_experts, input_dim * expert_hidden_size] (flattened embedding)
+    expert_weights_u = torch.zeros(num_experts, input_dim * expert_hidden_size, device=device, dtype=torch.float16)
+    # V weights: [num_experts, output_dim * expert_hidden_size] (flattened embedding)
+    expert_weights_v = torch.zeros(num_experts, output_dim * expert_hidden_size, device=device, dtype=torch.float16)
     
     # Fill with specific patterns - each expert has a unique pattern
     for i in range(num_experts):
-        expert_weights_u[i] = (i + 1) * 0.01  # Each expert has different magnitude
-        expert_weights_v[i] = (i + 1) * 0.01
+        expert_weights_u[i, :] = (i + 1) * 0.01  # Each expert has different magnitude
+        expert_weights_v[i, :] = (i + 1) * 0.01
     
     # First forward pass
     output1 = peer_forward_cutlass(
@@ -117,14 +121,15 @@ def test_direct_mode_vs_copy_mode():
     
     # Create identical inputs for both tests
     x = torch.randn(batch_size, seq_len, input_dim, device=device, dtype=torch.float16)
-    query_weight = torch.randn(num_heads, input_dim, query_dim, device=device, dtype=torch.float16)
-    query_bias = torch.randn(num_heads, query_dim, device=device, dtype=torch.float16)
-    key_weight_1 = torch.randn(num_heads, input_dim, int(num_experts**0.5), device=device, dtype=torch.float16)
-    key_weight_2 = torch.randn(num_heads, input_dim, int(num_experts**0.5), device=device, dtype=torch.float16)
+    query_weight = torch.randn(num_heads * query_dim, input_dim, device=device, dtype=torch.float16)
+    query_bias = torch.randn(num_heads * query_dim, device=device, dtype=torch.float16)
+    sub_key_dim = query_dim // 2  # Assuming 2 dimensions for product keys
+    key_weight_1 = torch.randn(int(num_experts**0.5), sub_key_dim, device=device, dtype=torch.float16)
+    key_weight_2 = torch.randn(int(num_experts**0.5), sub_key_dim, device=device, dtype=torch.float16)
     
-    # Create expert weights
-    expert_weights_u = torch.randn(num_experts, input_dim, expert_hidden_size, device=device, dtype=torch.float16)
-    expert_weights_v = torch.randn(num_experts, expert_hidden_size, output_dim, device=device, dtype=torch.float16)
+    # Create expert weights matching nn.Embedding format
+    expert_weights_u = torch.randn(num_experts, input_dim * expert_hidden_size, device=device, dtype=torch.float16)
+    expert_weights_v = torch.randn(num_experts, output_dim * expert_hidden_size, device=device, dtype=torch.float16)
     
     # Test direct mode
     os.environ["PEER_DIRECT_WEIGHT_ACCESS"] = "1"

@@ -1397,12 +1397,15 @@ void smoke_test() {
     
     // Allocate test inputs/outputs
     half *d_input, *d_query_weight, *d_query_bias, *d_sub_keys1, *d_sub_keys2, *d_output;
+    half *d_ln_scale, *d_ln_bias;
     cudaMalloc(&d_input, B * S * IN * sizeof(half));
     cudaMalloc(&d_query_weight, NumHeads * QueryDim * IN * sizeof(half));
     cudaMalloc(&d_query_bias, NumHeads * QueryDim * sizeof(half));
     cudaMalloc(&d_sub_keys1, int(std::sqrt(Experts) + 0.5) * QueryDim * sizeof(half));
     cudaMalloc(&d_sub_keys2, int(std::sqrt(Experts) + 0.5) * QueryDim * sizeof(half));
     cudaMalloc(&d_output, B * S * OUT * sizeof(half));
+    cudaMalloc(&d_ln_scale, NumHeads * QueryDim * sizeof(half));
+    cudaMalloc(&d_ln_bias, NumHeads * QueryDim * sizeof(half));
     
     // Initialize with random data
     curandGenerator_t gen;
@@ -1412,6 +1415,8 @@ void smoke_test() {
     curandGenerateUniform(gen, (float*)d_query_bias, NumHeads * QueryDim / 2);
     curandGenerateUniform(gen, (float*)d_sub_keys1, int(std::sqrt(Experts) + 0.5) * QueryDim / 2);
     curandGenerateUniform(gen, (float*)d_sub_keys2, int(std::sqrt(Experts) + 0.5) * QueryDim / 2);
+    curandGenerateUniform(gen, (float*)d_ln_scale, NumHeads * QueryDim / 2);
+    curandGenerateUniform(gen, (float*)d_ln_bias, NumHeads * QueryDim / 2);
     curandDestroyGenerator(gen);
     
     // Run forward pass
@@ -1421,7 +1426,7 @@ void smoke_test() {
     // Warmup
     for (int i = 0; i < 3; i++) {
         op.forward(d_input, d_query_weight, d_query_bias, d_sub_keys1, d_sub_keys2, 
-                   d_output, B, S, stream);
+                   d_output, d_ln_scale, d_ln_bias, B, S, 0.0f, stream);
     }
     cudaStreamSynchronize(stream);
     
@@ -1433,7 +1438,7 @@ void smoke_test() {
     cudaEventRecord(start, stream);
     for (int i = 0; i < 10; i++) {
         op.forward(d_input, d_query_weight, d_query_bias, d_sub_keys1, d_sub_keys2, 
-                   d_output, B, S, stream);
+                   d_output, d_ln_scale, d_ln_bias, B, S, 0.0f, stream);
     }
     cudaEventRecord(stop, stream);
     cudaStreamSynchronize(stream);
@@ -1460,6 +1465,8 @@ void smoke_test() {
     cudaFree(d_sub_keys1);
     cudaFree(d_sub_keys2);
     cudaFree(d_output);
+    cudaFree(d_ln_scale);
+    cudaFree(d_ln_bias);
     cudaStreamDestroy(stream);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
