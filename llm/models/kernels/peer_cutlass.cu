@@ -1,6 +1,3 @@
-// peer_cutlass_enhanced_production.cu
-// Production-ready PEER implementation with all correctness fixes
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -34,10 +31,53 @@ namespace peer {
 
 using namespace cute;
 
+// Platform-aware HBM capacity percentage
+float get_hbm_capacity_percentage() {
+    // Check environment variable first
+    const char* env_cap = std::getenv("PEER_HBM_CAPACITY_PERCENT");
+    if (env_cap) {
+        float cap = std::stof(env_cap) / 100.0f;
+        return std::max(0.01f, std::min(1.0f, cap));  // Clamp between 1% and 100%
+    }
+    
+    // Platform-specific defaults
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    
+    // Detect GPU architecture
+    int sm_major = prop.major;
+    int sm_minor = prop.minor;
+    
+    if (sm_major == 9) {  // H100 (SM 9.0)
+        // H100 has better memory bandwidth, can afford higher percentage
+        return 0.50f;  // 50% default
+    } else if (sm_major == 8 && sm_minor == 0) {  // A100 (SM 8.0)
+        // A100 default
+        return 0.40f;  // 40% default
+    } else if (sm_major == 8 && sm_minor == 6) {  // A40/RTX 3090 (SM 8.6)
+        // Consumer GPUs with less HBM
+        return 0.30f;  // 30% default
+    } else {
+        // Conservative default for unknown architectures
+        return 0.10f;  // 10% default
+    }
+}
+
 // Helper for alignment
 template<int N>
 __host__ __device__ constexpr size_t align_to(size_t x) {
     return (x + N - 1) / N * N;
+}
+
+// Warp-level reduction for sum
+__device__ inline float warpReduceSum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
 }
 
 // POD struct for device-side expert pointers with heat tracking
@@ -125,8 +165,12 @@ public:
         int output_dim,
         size_t hbm_capacity_mb = 16384  // 16GB for expert cache
     ) : num_experts_(num_experts) {
-        expert_u_bytes_ = input_dim * hidden_dim * sizeof(half);
-        expert_v_bytes_ = hidden_dim * output_dim * sizeof(half);
+        // Calculate expert weight sizes
+        // hidden_dim corresponds to expert_hidden_size in the PEER module
+        // expert_down: nn.Embedding(num_experts, input_dim * expert_hidden_size)
+        // expert_up: nn.Embedding(num_experts, output_dim * expert_hidden_size)
+        expert_u_bytes_ = input_dim * hidden_dim * sizeof(half);  // Down projection: input -> hidden
+        expert_v_bytes_ = hidden_dim * output_dim * sizeof(half);  // Up projection: hidden -> output
         __uint128_t bytes_per_expert = expert_u_bytes_ + expert_v_bytes_;
         
         cudaGetDevice(&device_id_);
@@ -134,10 +178,22 @@ public:
         // Calculate how many experts fit in HBM budget
         __uint128_t hbm_bytes = __uint128_t(hbm_capacity_mb) * 1024 * 1024;
         hbm_capacity_ = hbm_bytes / bytes_per_expert;
-        hbm_capacity_ = std::min(hbm_capacity_, size_t(num_experts / 10));  // Max 10% in HBM
         
-        printf("Hierarchical cache: %zu experts in HBM, %d total\n", 
-               hbm_capacity_, num_experts);
+        // Get platform-aware HBM capacity percentage limit
+        float hbm_percent_cap = get_hbm_capacity_percentage();
+        size_t percent_based_cap = size_t(num_experts * hbm_percent_cap);
+        
+        // Check if user-provided capacity would exceed the percentage cap
+        if (hbm_capacity_ > percent_based_cap) {
+            printf("Warning: Requested HBM capacity (%zu experts) exceeds %.0f%% limit (%zu experts).\n",
+                   hbm_capacity_, hbm_percent_cap * 100, percent_based_cap);
+            printf("         Capping at %.0f%% to prevent excessive HBM usage.\n", hbm_percent_cap * 100);
+            printf("         Set PEER_HBM_CAPACITY_PERCENT to override.\n");
+            hbm_capacity_ = percent_based_cap;
+        }
+        
+        printf("Hierarchical cache: %zu experts in HBM (%.1f%%), %d total\n", 
+               hbm_capacity_, 100.0f * hbm_capacity_ / num_experts, num_experts);
         
         // Allocate HBM pool
         cudaMalloc(&hbm_pool_u_, hbm_capacity_ * expert_u_bytes_);
@@ -843,18 +899,65 @@ __global__ void peer_kernel_enhanced(
                 }
                 __syncthreads();
                 
-                // Batch normalization
-                if (use_batch_norm && tid == 0) {
-                    float mean = 0.0f, var = 0.0f;
-                    for (int i = 0; i < QueryDim; i++) mean += float(query_smem[i]);
-                    mean /= QueryDim;
-                    for (int i = 0; i < QueryDim; i++) {
-                        float diff = float(query_smem[i]) - mean;
-                        var += diff * diff;
+                // Batch normalization with all threads participating
+                if (use_batch_norm) {
+                    // Shared memory for reduction
+                    __shared__ float reduction_buffer[32];  // For warp-level reductions
+                    __shared__ float shared_mean;
+                    __shared__ float shared_inv_std;
+                    
+                    // Step 1: Compute mean using all threads
+                    float thread_sum = 0.0f;
+                    for (int i = tid; i < QueryDim; i += blockDim.x) {
+                        thread_sum += float(query_smem[i]);
                     }
-                    var = rsqrtf(var / QueryDim + 1e-5f);
-                    for (int i = 0; i < QueryDim; i++) {
-                        float normalized = (float(query_smem[i]) - mean) * var;
+                    
+                    // Warp-level reduction for sum
+                    thread_sum = warpReduceSum(thread_sum);
+                    if (lane_id == 0) {
+                        reduction_buffer[warp_id] = thread_sum;
+                    }
+                    __syncthreads();
+                    
+                    // Final reduction by first warp
+                    if (warp_id == 0) {
+                        float warp_sum = (lane_id < (blockDim.x / 32)) ? reduction_buffer[lane_id] : 0.0f;
+                        warp_sum = warpReduceSum(warp_sum);
+                        if (tid == 0) {
+                            shared_mean = warp_sum / QueryDim;
+                        }
+                    }
+                    __syncthreads();
+                    
+                    // Step 2: Compute variance using all threads
+                    float thread_var = 0.0f;
+                    float mean = shared_mean;
+                    for (int i = tid; i < QueryDim; i += blockDim.x) {
+                        float diff = float(query_smem[i]) - mean;
+                        thread_var += diff * diff;
+                    }
+                    
+                    // Warp-level reduction for variance
+                    thread_var = warpReduceSum(thread_var);
+                    if (lane_id == 0) {
+                        reduction_buffer[warp_id] = thread_var;
+                    }
+                    __syncthreads();
+                    
+                    // Final reduction by first warp
+                    if (warp_id == 0) {
+                        float warp_var = (lane_id < (blockDim.x / 32)) ? reduction_buffer[lane_id] : 0.0f;
+                        warp_var = warpReduceSum(warp_var);
+                        if (tid == 0) {
+                            shared_inv_std = rsqrtf(warp_var / QueryDim + 1e-5f);
+                        }
+                    }
+                    __syncthreads();
+                    
+                    // Step 3: Apply normalization using all threads
+                    float inv_std = shared_inv_std;
+                    for (int i = tid; i < QueryDim; i += blockDim.x) {
+                        float normalized = (float(query_smem[i]) - mean) * inv_std;
                         if (bn_scale != nullptr) {
                             normalized = normalized * float(bn_scale[h * QueryDim + i]) + 
                                         float(bn_bias[h * QueryDim + i]);
@@ -1059,7 +1162,7 @@ public:
         int num_heads,
         int top_k,
         int query_dim,
-        int expert_hidden_size,
+        int expert_hidden_size,    // Maps to hidden_dim in HierarchicalExpertCache
         int input_dim,
         int output_dim,
         size_t hbm_cache_mb = 16384,
@@ -1077,6 +1180,13 @@ public:
         use_managed_memory_(use_managed) {
         
         // Create hierarchical cache
+        // Parameter mapping:
+        // - input_dim: dimension of model input features
+        // - expert_hidden_size: hidden dimension of each expert MLP
+        // - output_dim: dimension of model output features
+        // This matches the PEER module where:
+        // - expert_down: nn.Embedding(num_experts, input_dim * expert_hidden_size)
+        // - expert_up: nn.Embedding(num_experts, output_dim * expert_hidden_size)
         cache_ = std::make_unique<HierarchicalExpertCache>(
             num_experts, input_dim, expert_hidden_size, output_dim, hbm_cache_mb
         );
