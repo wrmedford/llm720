@@ -227,6 +227,8 @@ def peer_forward_cutlass(
         expert_hidden_size,
         top_k,
         layer_norm,
+        True,  # norm_keys
+        True,  # norm_query
         dropout_rate,
     )
     
