@@ -23,7 +23,17 @@ import sys
 
 # Check environment variable to decide which kernel to use
 _USE_TRITON_KERNEL = os.environ.get("USE_TRITON_KERNEL", "0") == "1"
-if _USE_TRITON_KERNEL:
+_USE_CUTLASS_KERNEL = os.environ.get("USE_CUTLASS_KERNEL", "0") == "1"
+
+if _USE_CUTLASS_KERNEL:
+    try:
+        # Import the CUTLASS kernel
+        from .kernels.peer_cutlass import peer_forward_cutlass
+        print("Using PEER CUTLASS kernel for optimized performance.")
+    except ImportError as e:
+        print(f"Warning: USE_CUTLASS_KERNEL is set, but CUTLASS kernel import failed: {e}. Falling back to PyTorch.")
+        _USE_CUTLASS_KERNEL = False
+elif _USE_TRITON_KERNEL:
     try:
         # Import the (stubbed) Triton kernel
         from .kernels.peer_triton import peer_fwd_kernel
@@ -424,12 +434,47 @@ class PEER(nn.Module):
         )
         return output
 
+    def _forward_cutlass(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass using the CUTLASS kernel.
+        """
+        # Extract sub-key tensors
+        sub_key_1 = self.sub_keys[0]
+        sub_key_2 = self.sub_keys[1] if len(self.sub_keys) > 1 else self.sub_keys[0]
+        
+        # Get query bias if it exists
+        query_bias = self.query_proj.bias if hasattr(self.query_proj, 'bias') and self.query_proj.bias is not None else None
+        
+        # Get LayerNorm weights if applicable
+        ln_weight = self.query_layer_norm.weight if self.query_layer_norm else None
+        ln_bias = self.query_layer_norm.bias if self.query_layer_norm else None
+        
+        # Call the CUTLASS kernel
+        output = peer_forward_cutlass(
+            x=hidden_states,
+            query_weight=self.query_proj.weight,
+            query_bias=query_bias,
+            key_weight_1=sub_key_1,
+            key_weight_2=sub_key_2,
+            expert_weights_u=self.expert_down.weight,
+            expert_weights_v=self.expert_up.weight,
+            num_heads=self.num_heads,
+            num_experts=self.num_experts,
+            expert_hidden_size=self.expert_hidden_size,
+            top_k=self.num_experts_per_tok,
+            dropout_rate=self.dropout.p,
+            layer_norm=self.batch_norm_query,
+            ln_weight=ln_weight,
+            ln_bias=ln_bias,
+        )
+        return output
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Main forward pass for the PEER module.
 
-        Dispatches to either the PyTorch implementation or the Triton kernel
-        based on the _USE_TRITON_KERNEL flag.
+        Dispatches to either the PyTorch implementation, CUTLASS kernel, or Triton kernel
+        based on the environment flags.
 
         Args:
             hidden_states: Tensor of shape [batch_size, seq_len, input_dim]
@@ -437,7 +482,10 @@ class PEER(nn.Module):
         Returns:
             output: Tensor of shape [batch_size, seq_len, output_dim]
         """
-        if _USE_TRITON_KERNEL:
+        if _USE_CUTLASS_KERNEL:
+            # Call the CUTLASS kernel implementation
+            return self._forward_cutlass(hidden_states)
+        elif _USE_TRITON_KERNEL:
             # Call the Triton kernel implementation
             # Note: Currently raises NotImplementedError
             return self._forward_triton(hidden_states)

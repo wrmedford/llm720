@@ -1,7 +1,50 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from setuptools import find_packages, setup
+from setuptools import find_packages, setup, Extension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import os
+
+# Check if CUDA is available
+try:
+    import torch
+    CUDA_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    CUDA_AVAILABLE = False
+
+# Define extensions
+ext_modules = []
+
+if CUDA_AVAILABLE and os.environ.get("BUILD_CUTLASS_KERNEL", "1") == "1":
+    # CUTLASS kernel extension
+    cutlass_ext = CUDAExtension(
+        name="llm.models.kernels.peer_cutlass_module",
+        sources=[
+            "llm/models/kernels/peer_cutlass.cu",
+            "llm/models/kernels/peer_cutlass_wrapper.cpp",
+        ],
+        include_dirs=[
+            # Add CUTLASS include path if needed
+            # os.environ.get("CUTLASS_PATH", "/usr/local/cutlass/include"),
+        ],
+        extra_compile_args={
+            "cxx": ["-O3", "-std=c++17"],
+            "nvcc": [
+                "-O3",
+                "-std=c++17",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "--expt-relaxed-constexpr",
+                "--expt-extended-lambda",
+                "--use_fast_math",
+                "-gencode=arch=compute_80,code=sm_80",  # A100
+                "-gencode=arch=compute_90,code=sm_90",  # H100
+            ],
+        },
+    )
+    ext_modules.append(cutlass_ext)
 
 setup(
     name="llm",
@@ -50,4 +93,6 @@ setup(
             "llm-eval=scripts.run_evaluation:main",
         ],
     },
+    ext_modules=ext_modules,
+    cmdclass={"build_ext": BuildExtension} if ext_modules else {},
 )

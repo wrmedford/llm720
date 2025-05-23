@@ -255,14 +255,24 @@ class FoundationModel(nn.Module):
         self.wte.weight = self.lm_head.weight
 
     def _init_weights(self, module):
-        """Initialize weights with small random values."""
+        """Initialize weights and set specific dtypes."""
         if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Initialize weights (typically in the model's main dtype, e.g., BF16/FP16)
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if isinstance(module, nn.Linear) and module.bias is not None:
+                # Initialize bias values
                 module.bias.data.zero_()
+                # --- Explicitly set bias dtype to FP32 ---
+                # Ensures bias remains FP32 even if model is initialized in BF16/FP16
+                module.bias.data = module.bias.data.to(torch.float32)
         elif isinstance(module, nn.LayerNorm):
+            # Initialize LayerNorm parameters
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+            # --- Explicitly set LayerNorm parameters dtype to FP32 ---
+            # Ensures LayerNorm remains FP32 even if model is initialized in BF16/FP16
+            module.weight.data = module.weight.data.to(torch.float32)
+            module.bias.data = module.bias.data.to(torch.float32)
 
     def get_input_embeddings(self):
         return self.wte
