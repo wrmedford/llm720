@@ -39,6 +39,8 @@ public:
         const __half* sub_keys1,
         const __half* sub_keys2,
         __half* output,
+        const __half* ln_scale,  // Added for LayerNorm scale
+        const __half* ln_bias,   // Added for LayerNorm bias
         int batch_size,
         int seq_len,
         float dropout_rate = 0.0f,
