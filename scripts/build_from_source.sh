@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Build script for llm project dependencies (torch, triton, flash-attn, transformer-engine)
+# Build script for llm project dependencies (torch, flash-attn, transformer-engine)
 # Adapted from a vllm build script.
 
 set -euo pipefail
@@ -121,7 +121,7 @@ reset_repo () {
 
 echo "Installing base build tools..."
 # Install build deps that aren't in project requirements files
-# Make sure to upgrade setuptools to avoid triton build bug
+# Make sure to upgrade setuptools
 uv pip install -U build cmake ninja pybind11 "setuptools<=76" wheel
 
 pushd src > /dev/null
