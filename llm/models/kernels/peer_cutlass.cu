@@ -648,19 +648,40 @@ struct OptimizedGemm {
 
 // ======================== PRODUCT KEY ROUTING ========================
 
-template<typename scalar_t, int top_k, int sqrt_n>
+// Helper function for partial sorting on device
+__device__ void partial_sort_topk_indices_dynamic(const float* scores, int* indices, float* top_scores, int k, int n) {
+    // Initialize indices
+    for (int i = 0; i < n; i++) indices[i] = i;
+    
+    // Simple partial sort for k elements (optimize later with CUB if needed)
+    for (int i = 0; i < k; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (scores[indices[j]] > scores[indices[i]]) {
+                int temp = indices[i];
+                indices[i] = indices[j];
+                indices[j] = temp;
+            }
+        }
+        if (top_scores) top_scores[i] = scores[indices[i]];
+    }
+}
+
+template<typename scalar_t, int top_k>
 __device__ void product_key_routing(
     const scalar_t* query,      // [d]
     const scalar_t* sub_keys1,  // [sqrt_n, d]
     const scalar_t* sub_keys2,  // [sqrt_n, d]
     int d,
+    int sqrt_n,                 // Now a runtime parameter
     int* expert_indices,        // [top_k]
     float* expert_scores,       // [top_k]
+    float* scores_buffer,       // Shared memory buffer for scores
     bool norm_keys = true,
     bool norm_query = true
 ) {
-    float scores1[sqrt_n];
-    float scores2[sqrt_n];
+    // Use provided shared memory buffer
+    float* scores1 = scores_buffer;
+    float* scores2 = scores_buffer + sqrt_n;
     
     // Normalize query if requested
     float query_norm = 0.0f;
@@ -721,6 +742,19 @@ __device__ void product_key_routing(
         scores2[i] = score;
     }
     
+    // FIXED: Use product key optimization to achieve O(√N + k²) complexity
+    // Calculate k_prime (number of candidates per dimension)
+    const int k_prime = min(sqrt_n, int(ceilf(powf(float(top_k), 0.5f))) + 2);
+    
+    // Get top k_prime from each dimension
+    int top_indices1[32];  // Assuming k_prime <= 32
+    int top_indices2[32];
+    float top_scores1_sorted[32];
+    float top_scores2_sorted[32];
+    
+    partial_sort_topk_indices_dynamic(scores1, top_indices1, top_scores1_sorted, k_prime, sqrt_n);
+    partial_sort_topk_indices_dynamic(scores2, top_indices2, top_scores2_sorted, k_prime, sqrt_n);
+    
     // Find top-k product scores
     struct Score {
         float value;
@@ -733,11 +767,11 @@ __device__ void product_key_routing(
         top_scores[i].index = -1;
     }
     
-    // Compute all product scores and maintain top-k
-    for (int i = 0; i < sqrt_n; i++) {
-        for (int j = 0; j < sqrt_n; j++) {
-            float prod_score = scores1[i] * scores2[j];
-            int expert_id = i * sqrt_n + j;
+    // Only compute k_prime × k_prime products instead of sqrt_n × sqrt_n
+    for (int i = 0; i < k_prime; i++) {
+        for (int j = 0; j < k_prime; j++) {
+            float prod_score = top_scores1_sorted[i] * top_scores2_sorted[j];
+            int expert_id = top_indices1[i] * sqrt_n + top_indices2[j];
             
             // Insert into top-k if necessary
             if (prod_score > top_scores[top_k-1].value) {
@@ -797,7 +831,6 @@ template<
     int NumHeads,
     int TopK,
     int QueryDim,
-    int SqrtN,
     int OUT,
     int BLOCK_DIM
 >
@@ -812,7 +845,8 @@ __global__ void peer_kernel_enhanced(
     const Element* __restrict__ bn_scale,
     const Element* __restrict__ bn_bias,
     int B, int S, int IN,
-    int chunk_size,  // Runtime parameter
+    int sqrt_n,              // Runtime parameter  
+    int chunk_size,          // Runtime parameter
     float dropout_rate = 0.0f,
     bool use_batch_norm = true,
     bool norm_keys = true,
@@ -838,6 +872,11 @@ __global__ void peer_kernel_enhanced(
     Element* query_smem = reinterpret_cast<Element*>((char*)v_buffer[1] + v_bytes);
     size_t query_bytes = align_to<64>(QueryDim * sizeof(Element));
     Element* hidden_smem = reinterpret_cast<Element*>((char*)query_smem + query_bytes);
+    size_t hidden_bytes = align_to<64>(Config::HiddenSize * sizeof(Element));
+    
+    // Add shared memory for product key routing scores
+    float* routing_scores = reinterpret_cast<float*>((char*)hidden_smem + hidden_bytes);
+    size_t routing_scores_bytes = align_to<64>(2 * sqrt_n * sizeof(float));
     
     // Pipeline for overlapping copy/compute
     __shared__ cuda::pipeline<cuda::thread_scope_block> pipe;
@@ -972,9 +1011,9 @@ __global__ void peer_kernel_enhanced(
                 __shared__ float expert_scores[TopK];
                 
                 if (tid == 0) {
-                    product_key_routing<Element, TopK, SqrtN>(
-                        query_smem, sub_keys1, sub_keys2, QueryDim,
-                        expert_indices, expert_scores,
+                    product_key_routing<Element, TopK>(
+                        query_smem, sub_keys1, sub_keys2, QueryDim, sqrt_n,
+                        expert_indices, expert_scores, routing_scores,
                         norm_keys, norm_query
                     );
                 }
@@ -1312,12 +1351,6 @@ public:
             constexpr int QueryDim = 256;
         #endif
         
-        #ifdef PEER_JIT_SQRT_N
-            constexpr int SqrtN = PEER_JIT_SQRT_N;
-        #else
-            constexpr int SqrtN = 1024;
-        #endif
-        
         #ifdef PEER_JIT_OUTPUT_DIM
             constexpr int OUT = PEER_JIT_OUTPUT_DIM;
         #else
@@ -1331,9 +1364,10 @@ public:
         smem_size += 2 * align_to<64>(Config::HiddenSize * output_dim_ * sizeof(half));  // V buffers
         smem_size += align_to<64>(query_dim_ * sizeof(half));  // Query (FP16)
         smem_size += align_to<64>(Config::HiddenSize * sizeof(half));  // Hidden activations (FP16)
+        smem_size += align_to<64>(2 * sqrt_n_ * sizeof(float));  // Routing scores
         
         // Set shared memory configuration
-        auto kernel_func = peer_kernel_enhanced<Config, half, NumHeads, TopK, QueryDim, SqrtN, OUT, BLOCK_DIM>;
+        auto kernel_func = peer_kernel_enhanced<Config, half, NumHeads, TopK, QueryDim, OUT, BLOCK_DIM>;
         set_smem_config((void*)kernel_func, smem_size);
         
         // No need to memset - kernel directly writes output
@@ -1345,7 +1379,8 @@ public:
             cache_->get_device_experts(),  // Device-only mirror
             ln_scale, ln_bias,  // Layer norm parameters
             batch_size, seq_len, input_dim_,
-            chunk_size,  // Runtime parameter
+            sqrt_n_,       // Runtime parameter
+            chunk_size,    // Runtime parameter
             dropout_rate_,
             true, true, true
         );
