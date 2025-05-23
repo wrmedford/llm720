@@ -153,64 +153,43 @@ def sample_data(peer_config):
 
 # --- Test Cases ---
 
-# Parameterize the test to run for both PyTorch and Triton paths
-@pytest.mark.parametrize("use_triton", [False, True], ids=["pytorch", "triton_kernel"])
-def test_peer_forward(peer_module, sample_data, peer_config, use_triton):
+def test_peer_forward(peer_module, sample_data, peer_config):
     """
-    Tests the forward pass of PEER for both PyTorch and Triton paths.
-    The Triton path is expected to fail until implemented.
+    Tests the forward pass of PEER using PyTorch implementation.
     """
     hidden_states = sample_data
     dtype = peer_config["dtype"]
     config_id = peer_config["id"]
 
-    # Set environment variable for the test case
-    env_var_value = "1" if use_triton else "0"
-    expected_exception = NotImplementedError if use_triton else None
+    # Run the forward pass (will call _forward_pytorch)
+    try:
+        output = peer_module(hidden_states)
 
-    # Use patch.dict to temporarily set the environment variable
-    # Also patch the module-level flag in llm.models.experts for immediate effect
-    # Use patch.dict to temporarily set the environment variable
-    # Also patch the module-level flag in llm.models.experts for immediate effect
-    with patch.dict(os.environ, {"USE_TRITON_KERNEL": env_var_value}), \
-         patch('llm.models.experts._USE_TRITON_KERNEL', use_triton):
+        # --- Common Checks ---
+        path_id = f"{config_id}-PyTorch"
 
-        # Run the forward pass (will call _forward_pytorch or _forward_triton)
-        try:
-            output = peer_module(hidden_states)
+        # Basic shape and type checks
+        assert output.shape[0] == hidden_states.shape[0], f"[{path_id}] Batch size mismatch"
+        assert output.shape[1] == hidden_states.shape[1], f"[{path_id}] Sequence length mismatch"
+        assert output.shape[2] == peer_config["output_dim"], f"[{path_id}] Output dimension mismatch"
+        assert output.dtype == dtype, f"[{path_id}] Output dtype mismatch"
 
-            # --- Common Checks for Both Paths ---
-            path_id = f"{config_id}-{'Triton' if use_triton else 'PyTorch'}"
+        # Check for NaNs or infinities
+        assert not torch.isnan(output).any(), f"[{path_id}] Output contains NaNs"
+        assert not torch.isinf(output).any(), f"[{path_id}] Output contains infinities"
 
-            # Basic shape and type checks
-            assert output.shape[0] == hidden_states.shape[0], f"[{path_id}] Batch size mismatch"
-            assert output.shape[1] == hidden_states.shape[1], f"[{path_id}] Sequence length mismatch"
-            assert output.shape[2] == peer_config["output_dim"], f"[{path_id}] Output dimension mismatch"
-            assert output.dtype == dtype, f"[{path_id}] Output dtype mismatch"
+        # Check gradients
+        if hidden_states.requires_grad:
+            try:
+                # Perform a backward pass
+                output.sum().backward()
+                assert hidden_states.grad is not None, f"[{path_id}] Gradients not computed for hidden_states"
+                assert not torch.isnan(hidden_states.grad).any(), f"[{path_id}] Gradients contain NaNs"
+                assert not torch.isinf(hidden_states.grad).any(), f"[{path_id}] Gradients contain Infs"
+            finally:
+                # Clean up gradients
+                if hidden_states.grad is not None:
+                    hidden_states.grad = None # Reset grad
 
-            # Check for NaNs or infinities
-            assert not torch.isnan(output).any(), f"[{path_id}] Output contains NaNs"
-            assert not torch.isinf(output).any(), f"[{path_id}] Output contains infinities"
-
-            # --- Specific Checks ---
-            if use_triton:
-                # Check if the output is all zeros (as expected from the stub)
-                assert torch.all(output == 0), f"[{path_id}] Triton stub output should be all zeros"
-                print(f"[{path_id}] Triton stub forward pass executed successfully (returned zeros).")
-                # Skip gradient check for stubbed Triton kernel
-            else:
-                # Check gradients only for PyTorch path for now
-                if hidden_states.requires_grad:
-                    try:
-                        # Perform a backward pass
-                        output.sum().backward()
-                        assert hidden_states.grad is not None, f"[{path_id}] Gradients not computed for hidden_states"
-                        assert not torch.isnan(hidden_states.grad).any(), f"[{path_id}] Gradients contain NaNs"
-                        assert not torch.isinf(hidden_states.grad).any(), f"[{path_id}] Gradients contain Infs"
-                    finally:
-                        # Clean up gradients
-                        if hidden_states.grad is not None:
-                            hidden_states.grad = None # Reset grad
-
-        except Exception as e:
-            pytest.fail(f"[{path_id}] PEER forward pass failed: {e}")
+    except Exception as e:
+        pytest.fail(f"[{path_id}] PEER forward pass failed: {e}")

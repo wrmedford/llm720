@@ -17,7 +17,6 @@ PEER implements a highly scalable Mixture-of-Experts architecture that can effic
 
 1. **PyTorch Implementation**: Reference implementation with full flexibility
 2. **CUTLASS Kernel**: Optimized CUDA kernel for H100/A100 GPUs (see [CUTLASS Kernel Documentation](CUTLASS_KERNEL.md))
-3. **Triton Kernel**: Planned implementation (currently stubbed)
 
 ## MLA (Multi-head Latent Attention)
 

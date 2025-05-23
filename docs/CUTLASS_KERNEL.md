@@ -165,16 +165,14 @@ from llm.models.kernels import peer_cutlass_module
 peer_cutlass_module.print_cache_stats()
 ```
 
-## Comparison with Triton
+## Why CUTLASS?
 
-While a Triton implementation was initially planned, the CUTLASS kernel was chosen due to:
+The CUTLASS kernel was chosen for this implementation due to:
 
 - **TMA Support**: Direct access to H100's Tensor Memory Accelerator
 - **Fine-grained Control**: Explicit shared memory management
 - **Proven Performance**: CUTLASS is battle-tested for production workloads
 - **Hardware Features**: Access to latest GPU features (e.g., asynchronous copies)
-
-The Triton kernel stub remains in the codebase for potential future development.
 
 ## Future Improvements
 
