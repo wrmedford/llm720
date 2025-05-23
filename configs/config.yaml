@@ -23,8 +23,8 @@ model_config:
 
   # MLA configuration (MLA is always used)
   mla_config:
-    q_lora_rank: 1536
-    kv_lora_rank: 512
+    q_lora_rank: 192  # ~0.25 × hidden_size (768), matching DeepSeek V3 ratio
+    kv_lora_rank: 64   # ~0.083 × hidden_size (768), matching DeepSeek V3 ratio
     qk_rope_head_dim: 64
     v_head_dim: 128
     qk_nope_head_dim: 128
