@@ -25,7 +25,8 @@ if CUDA_AVAILABLE and os.environ.get("BUILD_CUTLASS_KERNEL", "1") == "1":
         ],
         include_dirs=[
             # Add CUTLASS include path if needed
-            # os.environ.get("CUTLASS_PATH", "/usr/local/cutlass/include"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "cutlass", "include"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "cutlass", "tools", "util", "include"),
         ],
         extra_compile_args={
             "cxx": ["-O3", "-std=c++17"],

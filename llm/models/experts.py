@@ -82,6 +82,21 @@ class PEER(nn.Module):
             f"Product of dimensions {product_key_dim} = {product_size} must "
             f"equal the number of experts {num_experts}"
         )
+        
+        # If using CUTLASS kernel, verify num_experts is a perfect square
+        # and product_key_dim is symmetric
+        if os.environ.get('USE_CUTLASS_KERNEL', '0') == '1':
+            sqrt_n = int(num_experts ** 0.5)
+            if sqrt_n * sqrt_n != num_experts:
+                raise ValueError(
+                    f"CUTLASS kernel requires num_experts to be a perfect square. "
+                    f"Got {num_experts}, nearest perfect squares are {sqrt_n**2} or {(sqrt_n+1)**2}"
+                )
+            if len(product_key_dim) != 2 or product_key_dim[0] != product_key_dim[1]:
+                raise ValueError(
+                    f"CUTLASS kernel requires symmetric product key dimensions [sqrt_n, sqrt_n]. "
+                    f"Got {product_key_dim}, expected [{sqrt_n}, {sqrt_n}]"
+                )
 
         # Create the query network
         self.query_proj = nn.Linear(input_dim, num_heads * query_dim)

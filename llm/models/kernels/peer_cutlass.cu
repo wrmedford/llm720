@@ -2,7 +2,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda/barrier>
-#include <cuda/pipeline>
 #include <cassert>
 #include <cuda_bf16.h>
 #include <mma.h>
@@ -10,8 +9,11 @@
 
 // CUTLASS includes for optimized GEMM
 #include <cutlass/cutlass.h>
-#include <cutlass/gemm/device/gemm.h>
-#include <cutlass/gemm/device/gemm_universal.h>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/epilogue/collective/default_epilogue.hpp>
 #include <cutlass/arch/mma.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/epilogue/thread/linear_combination_relu.h>
@@ -26,6 +28,7 @@
 #include <mutex>
 
 #include "peer_cutlass.h"
+#include "peer_cutlass_impl.h"
 
 namespace peer {
 
@@ -80,16 +83,6 @@ __device__ inline float warpReduceSum(float val) {
     return val;
 }
 
-// POD struct for device-side expert pointers with heat tracking
-struct ExpertPtrDev {
-    const half* host_u;
-    const half* host_v; 
-    const half* dev_u;
-    const half* dev_v;
-    int hbm_slot;
-    bool is_hot;
-    unsigned int heat;  // Larger counter for multi-warp updates
-};
 
 // Device-side helper to fetch expert pointers
 __device__ inline void fetch_expert(int id, ExpertPtrDev* experts,
@@ -105,472 +98,71 @@ __device__ inline void fetch_expert(int id, ExpertPtrDev* experts,
     }
 }
 
+// Global kernel for extracting heat deltas (moved outside class)
+__global__ void extract_heat_deltas_kernel(
+    ExpertPtrDev* experts, unsigned int* deltas, int num_experts) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_experts) {
+        unsigned int heat = experts[idx].heat;
+        if (heat > 0) {
+            deltas[idx] = heat;
+            experts[idx].heat = 0;  // Reset
+        }
+    }
+}
+
 // ======================== HIERARCHICAL MEMORY MANAGER ========================
 
-class HierarchicalExpertCache {
-private:
-    // Expert metadata
-    struct ExpertInfo {
-        void* host_u_ptr;      // Pointer in system RAM
-        void* host_v_ptr;
-        void* device_u_ptr;    // Pointer in HBM (if cached)
-        void* device_v_ptr;
-        std::atomic<int> access_count{0};  // FIX: Make atomic to avoid races
-        bool is_hot{false};
-        int last_access_time{0};
-        int hbm_slot{-1};      // Which HBM slot this expert occupies
-    };
-    
-    std::vector<ExpertInfo> experts_;
-    
-    // CLOCK-based eviction (O(1) instead of O(N))
-    std::vector<int> clock_hand_;  // Maps slot -> expert_id
-    int clock_position_{0};
-    
-    // Memory pools
-    void* hbm_pool_u_;
-    void* hbm_pool_v_;
-    size_t hbm_capacity_;  // Number of experts that fit in HBM
-    size_t expert_u_bytes_;
-    size_t expert_v_bytes_;
-    
-    // Prefetch thread
-    std::thread prefetch_thread_;
-    std::atomic<bool> should_stop_{false};
-    std::mutex promotion_mutex_;  // Protect promotion decisions
-    
-    // Profiling - Split 128-bit atomic into two 64-bit
-    std::atomic<int> cache_hits_{0};
-    std::atomic<int> cache_misses_{0};
-    std::atomic<uint64_t> bytes_lo_{0};
-    std::atomic<uint64_t> bytes_hi_{0};
-    
-    // GPU device ID
-    int device_id_;
-    
-    // Device-side expert pointer tables
-    ExpertPtrDev* d_experts_managed_;  // Managed memory version
-    ExpertPtrDev* d_experts_device_;   // Device-only mirror for perf
-    
-    // FIX 4: Delta tracking for heat sync
-    unsigned int* d_heat_deltas_;      // Device array for heat deltas
-    unsigned int* h_heat_deltas_;      // Host pinned buffer
-    int num_experts_;
-    
-public:
-    HierarchicalExpertCache(
-        int num_experts,
-        int input_dim,
-        int hidden_dim,
-        int output_dim,
-        size_t hbm_capacity_mb = 16384  // 16GB for expert cache
-    ) : num_experts_(num_experts) {
-        // Calculate expert weight sizes
-        // hidden_dim corresponds to expert_hidden_size in the PEER module
-        // expert_down: nn.Embedding(num_experts, input_dim * expert_hidden_size)
-        // expert_up: nn.Embedding(num_experts, output_dim * expert_hidden_size)
-        expert_u_bytes_ = input_dim * hidden_dim * sizeof(half);  // Down projection: input -> hidden
-        expert_v_bytes_ = hidden_dim * output_dim * sizeof(half);  // Up projection: hidden -> output
-        __uint128_t bytes_per_expert = expert_u_bytes_ + expert_v_bytes_;
-        
-        cudaGetDevice(&device_id_);
-        
-        // Calculate how many experts fit in HBM budget
-        __uint128_t hbm_bytes = __uint128_t(hbm_capacity_mb) * 1024 * 1024;
-        hbm_capacity_ = hbm_bytes / bytes_per_expert;
-        
-        // Get platform-aware HBM capacity percentage limit
-        float hbm_percent_cap = get_hbm_capacity_percentage();
-        size_t percent_based_cap = size_t(num_experts * hbm_percent_cap);
-        
-        // Check if user-provided capacity would exceed the percentage cap
-        if (hbm_capacity_ > percent_based_cap) {
-            printf("Warning: Requested HBM capacity (%zu experts) exceeds %.0f%% limit (%zu experts).\n",
-                   hbm_capacity_, hbm_percent_cap * 100, percent_based_cap);
-            printf("         Capping at %.0f%% to prevent excessive HBM usage.\n", hbm_percent_cap * 100);
-            printf("         Set PEER_HBM_CAPACITY_PERCENT to override.\n");
-            hbm_capacity_ = percent_based_cap;
-        }
-        
-        printf("Hierarchical cache: %zu experts in HBM (%.1f%%), %d total\n", 
-               hbm_capacity_, 100.0f * hbm_capacity_ / num_experts, num_experts);
-        
-        // Allocate HBM pool
-        cudaMalloc(&hbm_pool_u_, hbm_capacity_ * expert_u_bytes_);
-        cudaMalloc(&hbm_pool_v_, hbm_capacity_ * expert_v_bytes_);
-        
-        // Initialize expert metadata
-        experts_.resize(num_experts);
-        clock_hand_.resize(hbm_capacity_, -1);
-        
-        // Allocate device-side expert pointer tables
-        cudaMallocManaged(&d_experts_managed_, num_experts * sizeof(ExpertPtrDev));
-        cudaMalloc(&d_experts_device_, num_experts * sizeof(ExpertPtrDev));  // Device-only mirror
-        
-        // FIX 4: Allocate heat delta tracking
-        cudaMalloc(&d_heat_deltas_, num_experts * sizeof(unsigned int));
-        cudaMallocHost(&h_heat_deltas_, num_experts * sizeof(unsigned int));
-        cudaMemset(d_heat_deltas_, 0, num_experts * sizeof(unsigned int));
-        
-        // Start prefetch thread
-        prefetch_thread_ = std::thread(&HierarchicalExpertCache::prefetch_loop, this);
-    }
-    
-    ~HierarchicalExpertCache() {
-        should_stop_ = true;
-        if (prefetch_thread_.joinable()) {
-            prefetch_thread_.join();
-        }
-        cudaFree(hbm_pool_u_);
-        cudaFree(hbm_pool_v_);
-        cudaFree(d_experts_managed_);
-        cudaFree(d_experts_device_);
-        cudaFree(d_heat_deltas_);
-        cudaFreeHost(h_heat_deltas_);
-    }
-    
-    // Allocate expert weights in system RAM using pinned memory
-    void allocate_expert_weights(half* u_weights, half* v_weights, bool use_managed = false) {
-        // Use pinned or managed memory based on flag
-        for (int i = 0; i < experts_.size(); i++) {
-            experts_[i].host_u_ptr = u_weights + i * (expert_u_bytes_ / sizeof(half));
-            experts_[i].host_v_ptr = v_weights + i * (expert_v_bytes_ / sizeof(half));
-            experts_[i].device_u_ptr = nullptr;
-            experts_[i].device_v_ptr = nullptr;
-            
-            // Initialize device-side pointer table
-            d_experts_managed_[i] = {
-                (const half*)experts_[i].host_u_ptr,
-                (const half*)experts_[i].host_v_ptr,
-                nullptr,
-                nullptr,
-                -1,
-                false,
-                0  // Initial heat
-            };
-        }
-        
-        // Copy to device-only mirror for performance
-        cudaMemcpy(d_experts_device_, d_experts_managed_, 
-                   num_experts_ * sizeof(ExpertPtrDev), cudaMemcpyHostToDevice);
-        
-        if (use_managed) {
-            // Proper size computation to avoid overflow
-            size_t u_total_bytes = size_t(__uint128_t(experts_.size()) * expert_u_bytes_);
-            size_t v_total_bytes = size_t(__uint128_t(experts_.size()) * expert_v_bytes_);
-            
-            // For managed memory, use advise
-            cudaMemAdvise(u_weights, u_total_bytes, 
-                          cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
-            cudaMemAdvise(v_weights, v_total_bytes,
-                          cudaMemAdviseSetPreferredLocation, cudaCpuDeviceId);
-            
-            // Advise that GPU will access these pages
-            cudaMemAdvise(u_weights, u_total_bytes, 
-                          cudaMemAdviseSetAccessedBy, device_id_);
-            cudaMemAdvise(v_weights, v_total_bytes,
-                          cudaMemAdviseSetAccessedBy, device_id_);
-            
-            // Mark as read-mostly if CUDA 12+
-            #if CUDA_VERSION >= 12000
-            cudaMemAdvise(u_weights, u_total_bytes, 
-                          cudaMemAdviseSetReadMostly, device_id_);
-            cudaMemAdvise(v_weights, v_total_bytes,
-                          cudaMemAdviseSetReadMostly, device_id_);
-            #endif
-        }
-    }
-    
-    // Update expert pointers when using PyTorch tensors directly
-    void update_expert_pointers(half* u_weights, half* v_weights) {
-        // Update host-side pointers
-        for (int i = 0; i < experts_.size(); i++) {
-            experts_[i].host_u_ptr = u_weights + i * (expert_u_bytes_ / sizeof(half));
-            experts_[i].host_v_ptr = v_weights + i * (expert_v_bytes_ / sizeof(half));
-            
-            // Update device-side pointer table
-            d_experts_managed_[i].host_u = (const half*)experts_[i].host_u_ptr;
-            d_experts_managed_[i].host_v = (const half*)experts_[i].host_v_ptr;
-        }
-        
-        // Copy updated pointers to device-only mirror
-        cudaMemcpy(d_experts_device_, d_experts_managed_, 
-                   num_experts_ * sizeof(ExpertPtrDev), cudaMemcpyHostToDevice);
-    }
-    
-    // Get device-side expert pointer table (use device mirror for perf)
-    ExpertPtrDev* get_device_experts() const {
-        return d_experts_device_;
-    }
-    
-    // Host-side version - with stats and promotion
-    __host__ void get_expert_ptrs(int expert_id, void*& u_ptr, void*& v_ptr, cudaStream_t stream) {
-        auto& info = experts_[expert_id];
-        info.access_count.fetch_add(1);
-        
-        if (info.is_hot && info.device_u_ptr != nullptr) {
-            // Expert is in HBM cache
-            u_ptr = info.device_u_ptr;
-            v_ptr = info.device_v_ptr;
-            cache_hits_++;
-        } else {
-            // Expert in system RAM - will be accessed via UVA
-            u_ptr = info.host_u_ptr;
-            v_ptr = info.host_v_ptr;
-            cache_misses_++;
-            
-            // Schedule for promotion if accessed frequently
-            if (info.access_count.load() > 10 && !info.is_hot) {
-                schedule_promotion(expert_id, stream);
-            }
-        }
-    }
-    
-    // Turn the "hint" into a real prefetch
-    void hint_future_access(const int* expert_ids, int count, cudaStream_t stream) {
-        for (int i = 0; i < count; i++) {
-            int expert_id = expert_ids[i];
-            auto& info = experts_[expert_id];
-            
-            if (!info.is_hot) {
-                // Prefetch to GPU if not already there
-                cudaMemPrefetchAsync(info.host_u_ptr, expert_u_bytes_, 
-                                     device_id_, stream);
-                cudaMemPrefetchAsync(info.host_v_ptr, expert_v_bytes_, 
-                                     device_id_, stream);
-                
-                // Track bytes transferred using helper
-                add_bytes(expert_u_bytes_ + expert_v_bytes_);
-            }
-        }
-    }
-    
-    // FIX 4: Efficient heat counter sync using deltas
-    void sync_heat_counters(cudaStream_t stream) {
-        // Extract heat deltas from device
-        static __global__ void extract_heat_deltas_kernel(
-            ExpertPtrDev* experts, unsigned int* deltas, int num_experts) {
-            int idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx < num_experts) {
-                unsigned int heat = experts[idx].heat;
-                if (heat > 0) {
-                    deltas[idx] = heat;
-                    experts[idx].heat = 0;  // Reset
-                }
-            }
-        }
-        
-        // Run kernel to extract deltas
-        int threads = 256;
-        int blocks = (num_experts_ + threads - 1) / threads;
-        extract_heat_deltas_kernel<<<blocks, threads, 0, stream>>>(
-            d_experts_device_, d_heat_deltas_, num_experts_);
-        
-        // Copy only non-zero deltas
-        cudaMemcpyAsync(h_heat_deltas_, d_heat_deltas_,
-                        num_experts_ * sizeof(unsigned int), 
-                        cudaMemcpyDeviceToHost, stream);
-        cudaStreamSynchronize(stream);
-        
-        // Update host-side access counts
-        for (int i = 0; i < num_experts_; i++) {
-            if (h_heat_deltas_[i] > 0) {
-                experts_[i].access_count.fetch_add(h_heat_deltas_[i]);
-                h_heat_deltas_[i] = 0;  // Reset
-            }
-        }
-        
-        // Clear device deltas
-        cudaMemsetAsync(d_heat_deltas_, 0, num_experts_ * sizeof(unsigned int), stream);
-    }
-    
-    // Implement print_stats
-    void print_stats() {
-        int hits = cache_hits_.load();
-        int misses = cache_misses_.load();
-        uint64_t lo = bytes_lo_.load();
-        uint64_t hi = bytes_hi_.load();
-        __uint128_t bytes = (__uint128_t(hi) << 64) | lo;
-        
-        if (hits + misses > 0) {
-            float hit_rate = 100.0f * hits / (hits + misses);
-            double gb_transferred = double(bytes) / (1024.0 * 1024.0 * 1024.0);
-            
-            printf("HierarchicalExpertCache Statistics:\n");
-            printf("  Cache hit rate: %.1f%% (%d hits, %d misses)\n", 
-                   hit_rate, hits, misses);
-            printf("  Total data transferred: %.2f GB\n", gb_transferred);
-            printf("  Hot experts: %d / %zu capacity\n", count_hot_experts(), hbm_capacity_);
-        }
-    }
-    
-private:
-    // Helper to add bytes with 128-bit counter
-    inline void add_bytes(uint64_t n) {
-        uint64_t old = bytes_lo_.fetch_add(n, std::memory_order_relaxed);
-        if (old > UINT64_MAX - n) {
-            bytes_hi_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    
-    int count_hot_experts() {
-        int count = 0;
-        for (const auto& e : experts_) {
-            if (e.is_hot) count++;
-        }
-        return count;
-    }
-    
-    // O(1) CLOCK-based eviction with heat awareness
-    void schedule_promotion(int expert_id, cudaStream_t stream) {
-        std::lock_guard<std::mutex> lock(promotion_mutex_);
-        
-        if (experts_[expert_id].is_hot) return;
-        
-        // Find a slot using CLOCK algorithm
-        int slot = -1;
-        for (int i = 0; i < hbm_capacity_ * 2; i++) {
-            int candidate_slot = clock_position_;
-            clock_position_ = (clock_position_ + 1) % hbm_capacity_;
-            
-            if (clock_hand_[candidate_slot] == -1) {
-                // Empty slot
-                slot = candidate_slot;
-                break;
-            }
-            
-            int victim_id = clock_hand_[candidate_slot];
-            
-            // Check both host-side access count and device-side heat
-            bool has_activity = experts_[victim_id].access_count.load() > 0 ||
-                               (d_experts_managed_[victim_id].heat > 128);  // High heat threshold
-            
-            if (!has_activity) {
-                // Found victim
-                evict_expert(victim_id);
-                slot = candidate_slot;
-                break;
-            } else {
-                // Give second chance
-                experts_[victim_id].access_count.store(0);
-                d_experts_managed_[victim_id].heat /= 2;  // Decay heat
-            }
-        }
-        
-        if (slot >= 0) {
-            promote_expert(expert_id, slot, stream);
-        }
-    }
-    
-    void promote_expert(int expert_id, int slot, cudaStream_t stream) {
-        experts_[expert_id].hbm_slot = slot;
-        clock_hand_[slot] = expert_id;
-        
-        // Copy to HBM
-        experts_[expert_id].device_u_ptr = (char*)hbm_pool_u_ + slot * expert_u_bytes_;
-        experts_[expert_id].device_v_ptr = (char*)hbm_pool_v_ + slot * expert_v_bytes_;
-        
-        cudaMemcpyAsync(experts_[expert_id].device_u_ptr,
-                        experts_[expert_id].host_u_ptr,
-                        expert_u_bytes_, cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(experts_[expert_id].device_v_ptr,
-                        experts_[expert_id].host_v_ptr,
-                        expert_v_bytes_, cudaMemcpyHostToDevice, stream);
-        
-        experts_[expert_id].is_hot = true;
-        
-        // Update device-side pointer table
-        d_experts_managed_[expert_id].dev_u = (const half*)experts_[expert_id].device_u_ptr;
-        d_experts_managed_[expert_id].dev_v = (const half*)experts_[expert_id].device_v_ptr;
-        d_experts_managed_[expert_id].hbm_slot = slot;
-        d_experts_managed_[expert_id].is_hot = true;
-        
-        // Update device mirror asynchronously
-        cudaMemcpyAsync(d_experts_device_ + expert_id, d_experts_managed_ + expert_id,
-                        sizeof(ExpertPtrDev), cudaMemcpyHostToDevice, stream);
-        
-        add_bytes(expert_u_bytes_ + expert_v_bytes_);
-    }
-    
-    void evict_expert(int expert_id) {
-        int slot = experts_[expert_id].hbm_slot;
-        if (slot >= 0) {
-            clock_hand_[slot] = -1;
-        }
-        
-        experts_[expert_id].is_hot = false;
-        experts_[expert_id].device_u_ptr = nullptr;
-        experts_[expert_id].device_v_ptr = nullptr;
-        experts_[expert_id].hbm_slot = -1;
-        
-        // Update device-side pointer table
-        d_experts_managed_[expert_id].dev_u = nullptr;
-        d_experts_managed_[expert_id].dev_v = nullptr;
-        d_experts_managed_[expert_id].hbm_slot = -1;
-        d_experts_managed_[expert_id].is_hot = false;
-    }
-    
-    void prefetch_loop() {
-        cudaStream_t prefetch_stream;
-        cudaStreamCreate(&prefetch_stream);
-        
-        while (!should_stop_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            static int counter = 0;
-            counter++;
-            
-            // Sync heat counters periodically
-            if (counter % 10 == 0) {
-                sync_heat_counters(prefetch_stream);
-            }
-            
-            // Print stats periodically
-            if (counter % 50 == 0) {
-                print_stats();
-            }
-        }
-        
-        cudaStreamDestroy(prefetch_stream);
-    }
-};
 
 // ======================== OPTIMIZED GEMM USING CUTLASS ========================
 
-// CUTLASS-based GEMM for optimal performance
+// CUTLASS-based GEMM for optimal performance on SM90
 template<typename Element>
 struct OptimizedGemm {
     // Define the GEMM operation
-    using ElementA = Element;
-    using ElementB = Element;
-    using ElementC = Element;
+    using ElementA = cutlass::half_t;
+    using ElementB = cutlass::half_t;
+    using ElementC = cutlass::half_t;
     using ElementAccumulator = float;
     
-    using ThreadblockShape = cutlass::gemm::GemmShape<16, 128, 32>;
-    using WarpShape = cutlass::gemm::GemmShape<16, 32, 32>;
-    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+    // SM90 configuration using collective builder
+    using ArchTag = cutlass::arch::Sm90;
+    using OperatorClass = cutlass::arch::OpClassTensorOp;
+    using TileShape = Shape<_128,_128,_32>;
+    using ClusterShape = Shape<_2,_2,_1>;
     
-    using EpilogueOp = cutlass::epilogue::thread::LinearCombination<
-        ElementC,
-        128 / cutlass::sizeof_bits<ElementC>::value,
+    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+    
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        TileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementAccumulator,
+        ElementC, cutlass::layout::RowMajor, AlignmentC,
+        ElementC, cutlass::layout::RowMajor, AlignmentC,
+        cutlass::epilogue::collective::EpilogueScheduleAuto
+    >::CollectiveOp;
+    
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        ElementA, cutlass::layout::RowMajor, AlignmentA,
+        ElementB, cutlass::layout::RowMajor, AlignmentB,
         ElementAccumulator,
-        ElementAccumulator
+        TileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto
+    >::CollectiveOp;
+    
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int,int,int>, // ProblemShape
+        CollectiveMainloop,
+        CollectiveEpilogue
     >;
     
-    using Gemm = cutlass::gemm::device::GemmUniversal<
-        ElementA, cutlass::layout::RowMajor,
-        ElementB, cutlass::layout::RowMajor,
-        ElementC, cutlass::layout::RowMajor,
-        ElementAccumulator,
-        cutlass::arch::OpClassTensorOp,
-        cutlass::arch::Sm90,
-        ThreadblockShape,
-        WarpShape,
-        InstructionShape,
-        EpilogueOp,
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
-        4  // Stages
-    >;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
     
     // FIX 2: WMMA with proper bounds checking
     __device__ static void gemm_tn_safe(
@@ -878,10 +470,6 @@ __global__ void peer_kernel_enhanced(
     float* routing_scores = reinterpret_cast<float*>((char*)hidden_smem + hidden_bytes);
     size_t routing_scores_bytes = align_to<64>(2 * sqrt_n * sizeof(float));
     
-    // Pipeline for overlapping copy/compute
-    __shared__ cuda::pipeline<cuda::thread_scope_block> pipe;
-    auto pipe_role = cuda::make_pipeline_role(pipe);
-    
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
@@ -1055,9 +643,17 @@ __global__ void peer_kernel_enhanced(
                             
                             for (int off = tid * 64; off < bytes; off += BLOCK_DIM * 64) {
                                 if (off + 64 <= bytes) {
-                                    asm volatile("cp.async.bulk.shared::cluster.global [%0], [%1], 64;"
-                                               :: "r"((uint32_t)__cvta_generic_to_shared(dst + off)), 
-                                                  "l"(src + off));
+                                    // Use regular memcpy instead of cp.async.bulk
+                                    // This is compatible with all CUDA versions
+                                    if ((uintptr_t)(dst + off) % 16 == 0 && (uintptr_t)(src + off) % 16 == 0) {
+                                        // 128-bit loads if aligned
+                                        *reinterpret_cast<float4*>(dst + off) = *reinterpret_cast<const float4*>(src + off);
+                                    } else {
+                                        // Fallback to smaller loads
+                                        for (int i = 0; i < 64; i += sizeof(float)) {
+                                            *reinterpret_cast<float*>(dst + off + i) = *reinterpret_cast<const float*>(src + off + i);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1069,17 +665,21 @@ __global__ void peer_kernel_enhanced(
                             
                             for (int off = (tid - 32) * 64; off < bytes; off += (BLOCK_DIM - 32) * 64) {
                                 if (off + 64 <= bytes) {
-                                    asm volatile("cp.async.bulk.shared::cluster.global [%0], [%1], 64;"
-                                               :: "r"((uint32_t)__cvta_generic_to_shared(dst + off)), 
-                                                  "l"(src + off));
+                                    // Use regular memcpy instead of cp.async.bulk
+                                    if ((uintptr_t)(dst + off) % 16 == 0 && (uintptr_t)(src + off) % 16 == 0) {
+                                        // 128-bit loads if aligned
+                                        *reinterpret_cast<float4*>(dst + off) = *reinterpret_cast<const float4*>(src + off);
+                                    } else {
+                                        // Fallback to smaller loads
+                                        for (int i = 0; i < 64; i += sizeof(float)) {
+                                            *reinterpret_cast<float*>(dst + off + i) = *reinterpret_cast<const float*>(src + off + i);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     
-                    // Commit and wait for copy
-                    asm volatile("cp.async.commit_group;");
-                    asm volatile("cp.async.wait_group 0;");
                     __syncthreads();
                     
                     // All warps compute GEMM
@@ -1175,235 +775,225 @@ void set_smem_config(void* kernel_ptr, size_t smem_size) {
     }
 }
 
-class PEEROperatorEnhanced {
-private:
-    int num_experts_;
-    int num_heads_;
-    int top_k_;
-    int query_dim_;
-    int expert_hidden_size_;
-    int sqrt_n_;
-    int input_dim_;
-    int output_dim_;
-    float dropout_rate_;
+// PEEROperatorEnhancedImpl implementation
+PEEROperatorEnhancedImpl::PEEROperatorEnhancedImpl(
+    int num_experts,
+    int num_heads,
+    int top_k,
+    int query_dim,
+    int expert_hidden_size,
+    int input_dim,
+    int output_dim,
+    size_t hbm_cache_mb,
+    bool use_managed
+) : num_experts_(num_experts),
+    num_heads_(num_heads),
+    top_k_(top_k),
+    query_dim_(query_dim),
+    expert_hidden_size_(expert_hidden_size),
+    sqrt_n_(int(std::sqrt(double(num_experts)) + 0.5)),
+    input_dim_(input_dim),
+    output_dim_(output_dim),
+    u_weights_(nullptr),
+    v_weights_(nullptr),
+    use_managed_memory_(use_managed) {
     
-    // Hierarchical memory cache
-    std::unique_ptr<HierarchicalExpertCache> cache_;
-    
-    // UVA-allocated weights
-    half* u_weights_;
-    half* v_weights_;
-    bool use_managed_memory_;
-    
-public:
-    PEEROperatorEnhanced(
-        int num_experts,
-        int num_heads,
-        int top_k,
-        int query_dim,
-        int expert_hidden_size,    // Maps to hidden_dim in HierarchicalExpertCache
-        int input_dim,
-        int output_dim,
-        size_t hbm_cache_mb = 16384,
-        bool use_managed = false  // Option to use pinned memory
-    ) : num_experts_(num_experts),
-        num_heads_(num_heads),
-        top_k_(top_k),
-        query_dim_(query_dim),
-        expert_hidden_size_(expert_hidden_size),
-        sqrt_n_(int(std::sqrt(double(num_experts)) + 0.5)),  // Proper rounding
-        input_dim_(input_dim),
-        output_dim_(output_dim),
-        u_weights_(nullptr),
-        v_weights_(nullptr),
-        use_managed_memory_(use_managed) {
-        
-        // Create hierarchical cache
-        // Parameter mapping:
-        // - input_dim: dimension of model input features
-        // - expert_hidden_size: hidden dimension of each expert MLP
-        // - output_dim: dimension of model output features
-        // This matches the PEER module where:
-        // - expert_down: nn.Embedding(num_experts, input_dim * expert_hidden_size)
-        // - expert_up: nn.Embedding(num_experts, output_dim * expert_hidden_size)
-        cache_ = std::make_unique<HierarchicalExpertCache>(
-            num_experts, input_dim, expert_hidden_size, output_dim, hbm_cache_mb
-        );
-    }
-    
-    ~PEEROperatorEnhanced() {
-        if (u_weights_) {
-            if (use_managed_memory_) {
-                cudaFree(u_weights_);
-            } else {
-                cudaFreeHost(u_weights_);
-            }
-        }
-        if (v_weights_) {
-            if (use_managed_memory_) {
-                cudaFree(v_weights_);
-            } else {
-                cudaFreeHost(v_weights_);
-            }
-        }
-    }
-    
-    void allocate_weights() {
-        // Allocate using pinned or managed memory
-        __uint128_t u_size = __uint128_t(num_experts_) * input_dim_ * expert_hidden_size_ * sizeof(half);
-        __uint128_t v_size = __uint128_t(num_experts_) * expert_hidden_size_ * output_dim_ * sizeof(half);
-        
+    cache_ = std::make_unique<HierarchicalExpertCache>(
+        num_experts, input_dim, expert_hidden_size, output_dim, hbm_cache_mb
+    );
+}
+
+PEEROperatorEnhancedImpl::~PEEROperatorEnhancedImpl() {
+    if (u_weights_) {
         if (use_managed_memory_) {
-            // Managed memory (slower first access)
-            cudaMallocManaged(&u_weights_, u_size);
-            cudaMallocManaged(&v_weights_, v_size);
+            cudaFree(u_weights_);
         } else {
-            // Use pinned memory for better performance
-            cudaMallocHost(&u_weights_, u_size);
-            cudaMallocHost(&v_weights_, v_size);
+            cudaFreeHost(u_weights_);
         }
-        
-        // Initialize with random values (in production, load from checkpoint)
-        // ... initialization code ...
-        
-        // Register with cache
-        cache_->allocate_expert_weights(u_weights_, v_weights_, use_managed_memory_);
-        
-        printf("Allocated %.2f GB of expert weights in %s memory\n",
-               double(u_size + v_size) / (1024.0 * 1024.0 * 1024.0),
-               use_managed_memory_ ? "managed" : "pinned");
     }
-    
-    // Copy weights from PyTorch tensors to internal buffers
-    void copy_weights_from_torch(const half* torch_u_weights, const half* torch_v_weights) {
-        __uint128_t u_size = __uint128_t(num_experts_) * input_dim_ * expert_hidden_size_ * sizeof(half);
-        __uint128_t v_size = __uint128_t(num_experts_) * expert_hidden_size_ * output_dim_ * sizeof(half);
-        
-        // Copy from PyTorch tensors to our allocated memory
-        memcpy(u_weights_, torch_u_weights, u_size);
-        memcpy(v_weights_, torch_v_weights, v_size);
-        
-        // If using managed memory, prefetch to GPU for better performance
+    if (v_weights_) {
         if (use_managed_memory_) {
-            int device;
-            cudaGetDevice(&device);
-            cudaMemPrefetchAsync(u_weights_, u_size, device);
-            cudaMemPrefetchAsync(v_weights_, v_size, device);
+            cudaFree(v_weights_);
+        } else {
+            cudaFreeHost(v_weights_);
         }
     }
+}
+
+// PEEROperatorEnhanced implementation (delegates to pImpl)
+PEEROperatorEnhanced::PEEROperatorEnhanced(
+    int num_experts,
+    int num_heads,
+    int top_k,
+    int query_dim,
+    int expert_hidden_size,
+    int input_dim,
+    int output_dim,
+    size_t hbm_cache_mb,
+    bool use_managed
+) : pImpl(std::make_unique<PEEROperatorEnhancedImpl>(
+        num_experts, num_heads, top_k, query_dim, expert_hidden_size,
+        input_dim, output_dim, hbm_cache_mb, use_managed
+    )) {
+}
+
+PEEROperatorEnhanced::~PEEROperatorEnhanced() = default;
+
+void PEEROperatorEnhanced::allocate_weights() {
+    // Allocate using pinned or managed memory
+    __uint128_t u_size = __uint128_t(pImpl->num_experts_) * pImpl->input_dim_ * pImpl->expert_hidden_size_ * sizeof(half);
+    __uint128_t v_size = __uint128_t(pImpl->num_experts_) * pImpl->expert_hidden_size_ * pImpl->output_dim_ * sizeof(half);
     
-    // Direct pointer mode: Use PyTorch tensors directly without copying
-    void set_weight_pointers(const half* torch_u_weights, const half* torch_v_weights) {
-        // Directly use PyTorch-managed memory
-        // WARNING: This bypasses our internal allocation and the caller must ensure
-        // the PyTorch tensors remain valid during kernel execution
-        u_weights_ = const_cast<half*>(torch_u_weights);
-        v_weights_ = const_cast<half*>(torch_v_weights);
-        
-        // Update the cache's expert pointers to use the PyTorch memory
-        cache_->update_expert_pointers(u_weights_, v_weights_);
+    if (pImpl->use_managed_memory_) {
+        // Managed memory (slower first access)
+        cudaMallocManaged(&pImpl->u_weights_, u_size);
+        cudaMallocManaged(&pImpl->v_weights_, v_size);
+    } else {
+        // Use pinned memory for better performance
+        cudaMallocHost(&pImpl->u_weights_, u_size);
+        cudaMallocHost(&pImpl->v_weights_, v_size);
     }
     
-    void forward(
-        const half* input,
-        const half* query_weight,
-        const half* query_bias,
-        const half* sub_keys1,
-        const half* sub_keys2,
-        half* output,
-        const half* ln_scale,  // Layer norm scale/weight
-        const half* ln_bias,   // Layer norm bias
-        int batch_size,
-        int seq_len,
-        float dropout_rate = 0.0f,
-        cudaStream_t stream = 0
-    ) {
-        dropout_rate_ = dropout_rate;  // Store for kernel use
-        // Compute chunk size at runtime
-        int chunk_size = compute_l2_chunk_size<half>(input_dim_);
-        chunk_size = std::min(chunk_size, batch_size * seq_len);
-        chunk_size = std::max(chunk_size, 1);  // At least 1 token
-        
-        // Enhanced kernel configuration
-        using Config = PEERConfig<1048576, 56, 128, 256, 64>;
-        constexpr int BLOCK_DIM = 128;
-        
-        int num_tokens = batch_size * seq_len;
-        int grid_size = (num_tokens + chunk_size - 1) / chunk_size;
-        grid_size = min(grid_size, 256);  // Limit grid size
-        
-        // Use JIT-defined parameters or defaults
-        #ifdef PEER_JIT_TOP_K
-            constexpr int TopK = PEER_JIT_TOP_K;
-        #else
-            constexpr int TopK = 16;
-        #endif
-        
-        #ifdef PEER_JIT_NUM_HEADS
-            constexpr int NumHeads = PEER_JIT_NUM_HEADS;
-        #else
-            constexpr int NumHeads = 8;
-        #endif
-        
-        #ifdef PEER_JIT_QUERY_DIM
-            constexpr int QueryDim = PEER_JIT_QUERY_DIM;
-        #else
-            constexpr int QueryDim = 256;
-        #endif
-        
-        #ifdef PEER_JIT_OUTPUT_DIM
-            constexpr int OUT = PEER_JIT_OUTPUT_DIM;
-        #else
-            constexpr int OUT = 1024;
-        #endif
-        
-        // Calculate shared memory with proper padding
-        size_t smem_size = 0;
-        smem_size += align_to<64>(chunk_size * input_dim_ * sizeof(half));  // Token cache
-        smem_size += 2 * align_to<64>(input_dim_ * Config::HiddenSize * sizeof(half));  // U buffers
-        smem_size += 2 * align_to<64>(Config::HiddenSize * output_dim_ * sizeof(half));  // V buffers
-        smem_size += align_to<64>(query_dim_ * sizeof(half));  // Query (FP16)
-        smem_size += align_to<64>(Config::HiddenSize * sizeof(half));  // Hidden activations (FP16)
-        smem_size += align_to<64>(2 * sqrt_n_ * sizeof(float));  // Routing scores
-        
-        // Set shared memory configuration
-        auto kernel_func = peer_kernel_enhanced<Config, half, NumHeads, TopK, QueryDim, OUT, BLOCK_DIM>;
-        set_smem_config((void*)kernel_func, smem_size);
-        
-        // No need to memset - kernel directly writes output
-        
-        // Launch enhanced kernel
-        kernel_func<<<grid_size, BLOCK_DIM, smem_size, stream>>>(
-            input, query_weight, query_bias,
-            sub_keys1, sub_keys2, output,
-            cache_->get_device_experts(),  // Device-only mirror
-            ln_scale, ln_bias,  // Layer norm parameters
-            batch_size, seq_len, input_dim_,
-            sqrt_n_,       // Runtime parameter
-            chunk_size,    // Runtime parameter
-            dropout_rate_,
-            true, true, true
+    // Initialize with random values (in production, load from checkpoint)
+    // ... initialization code ...
+    
+    // Register with cache
+    pImpl->cache_->allocate_expert_weights(pImpl->u_weights_, pImpl->v_weights_, pImpl->use_managed_memory_);
+    
+    printf("Allocated %.2f GB of expert weights in %s memory\n",
+           double(u_size + v_size) / (1024.0 * 1024.0 * 1024.0),
+           pImpl->use_managed_memory_ ? "managed" : "pinned");
+}
+
+// Copy weights from PyTorch tensors to internal buffers
+void PEEROperatorEnhanced::copy_weights_from_torch(const half* torch_u_weights, const half* torch_v_weights) {
+    __uint128_t u_size = __uint128_t(pImpl->num_experts_) * pImpl->input_dim_ * pImpl->expert_hidden_size_ * sizeof(half);
+    __uint128_t v_size = __uint128_t(pImpl->num_experts_) * pImpl->expert_hidden_size_ * pImpl->output_dim_ * sizeof(half);
+    
+    // Copy from PyTorch tensors to our allocated memory
+    memcpy(pImpl->u_weights_, torch_u_weights, u_size);
+    memcpy(pImpl->v_weights_, torch_v_weights, v_size);
+    
+    // If using managed memory, prefetch to GPU for better performance
+    if (pImpl->use_managed_memory_) {
+        int device;
+        cudaGetDevice(&device);
+        cudaMemPrefetchAsync(pImpl->u_weights_, u_size, device);
+        cudaMemPrefetchAsync(pImpl->v_weights_, v_size, device);
+    }
+}
+
+// Direct pointer mode: Use PyTorch tensors directly without copying
+void PEEROperatorEnhanced::set_weight_pointers(const half* torch_u_weights, const half* torch_v_weights) {
+    // Directly use PyTorch-managed memory
+    // WARNING: This bypasses our internal allocation and the caller must ensure
+    // the PyTorch tensors remain valid during kernel execution
+    pImpl->u_weights_ = const_cast<half*>(torch_u_weights);
+    pImpl->v_weights_ = const_cast<half*>(torch_v_weights);
+    
+    // Update the cache's expert pointers to use the PyTorch memory
+    pImpl->cache_->update_expert_pointers(pImpl->u_weights_, pImpl->v_weights_);
+}
+
+void PEEROperatorEnhanced::forward(
+    const half* input,
+    const half* query_weight,
+    const half* query_bias,
+    const half* sub_keys1,
+    const half* sub_keys2,
+    half* output,
+    const half* ln_scale,  // Layer norm scale/weight
+    const half* ln_bias,   // Layer norm bias
+    int batch_size,
+    int seq_len,
+    float dropout_rate,
+    cudaStream_t stream
+) {
+    pImpl->dropout_rate_ = dropout_rate;  // Store for kernel use
+    // Compute chunk size at runtime
+    int chunk_size = compute_l2_chunk_size<half>(pImpl->input_dim_);
+    chunk_size = std::min(chunk_size, batch_size * seq_len);
+    chunk_size = std::max(chunk_size, 1);  // At least 1 token
+    
+    // Enhanced kernel configuration
+    using Config = PEERConfig<1048576, 56, 128, 256, 64>;
+    constexpr int BLOCK_DIM = 128;
+    
+    int num_tokens = batch_size * seq_len;
+    int grid_size = (num_tokens + chunk_size - 1) / chunk_size;
+    grid_size = min(grid_size, 256);  // Limit grid size
+    
+    // Use JIT-defined parameters or defaults
+    #ifdef PEER_JIT_TOP_K
+        constexpr int TopK = PEER_JIT_TOP_K;
+    #else
+        constexpr int TopK = 16;
+    #endif
+    
+    #ifdef PEER_JIT_NUM_HEADS
+        constexpr int NumHeads = PEER_JIT_NUM_HEADS;
+    #else
+        constexpr int NumHeads = 8;
+    #endif
+    
+    #ifdef PEER_JIT_QUERY_DIM
+        constexpr int QueryDim = PEER_JIT_QUERY_DIM;
+    #else
+        constexpr int QueryDim = 256;
+    #endif
+    
+    #ifdef PEER_JIT_OUTPUT_DIM
+        constexpr int OUT = PEER_JIT_OUTPUT_DIM;
+    #else
+        constexpr int OUT = 1024;
+    #endif
+    
+    // Calculate shared memory with proper padding
+    size_t smem_size = 0;
+    smem_size += align_to<64>(chunk_size * pImpl->input_dim_ * sizeof(half));  // Token cache
+    smem_size += 2 * align_to<64>(pImpl->input_dim_ * Config::HiddenSize * sizeof(half));  // U buffers
+    smem_size += 2 * align_to<64>(Config::HiddenSize * pImpl->output_dim_ * sizeof(half));  // V buffers
+    smem_size += align_to<64>(pImpl->query_dim_ * sizeof(half));  // Query (FP16)
+    smem_size += align_to<64>(Config::HiddenSize * sizeof(half));  // Hidden activations (FP16)
+    smem_size += align_to<64>(2 * pImpl->sqrt_n_ * sizeof(float));  // Routing scores
+    
+    // Set shared memory configuration
+    auto kernel_func = peer_kernel_enhanced<Config, half, NumHeads, TopK, QueryDim, OUT, BLOCK_DIM>;
+    set_smem_config((void*)kernel_func, smem_size);
+    
+    // No need to memset - kernel directly writes output
+    
+    // Launch enhanced kernel
+    kernel_func<<<grid_size, BLOCK_DIM, smem_size, stream>>>(
+        input, query_weight, query_bias,
+        sub_keys1, sub_keys2, output,
+        pImpl->cache_->get_device_experts(),  // Device-only mirror
+        ln_scale, ln_bias,  // Layer norm parameters
+        batch_size, seq_len, pImpl->input_dim_,
+        pImpl->sqrt_n_,       // Runtime parameter
+        chunk_size,    // Runtime parameter
+        pImpl->dropout_rate_,
+        true, true, true
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("Enhanced PEER kernel launch failed: ") + 
+            cudaGetErrorString(err)
         );
-        
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("Enhanced PEER kernel launch failed: ") + 
-                cudaGetErrorString(err)
-            );
-        }
     }
-    
-    void print_cache_stats() {
-        cache_->print_stats();
-    }
-    
-    // Getters for validation in wrapper
-    int num_experts() const { return num_experts_; }
-    int num_heads() const { return num_heads_; }
-    int input_dim() const { return input_dim_; }
-    int output_dim() const { return output_dim_; }
-};
+}
+
+void PEEROperatorEnhanced::print_cache_stats() {
+    pImpl->cache_->print_stats();
+}
+
+// Getters
+int PEEROperatorEnhanced::num_experts() const { return pImpl->num_experts_; }
+int PEEROperatorEnhanced::num_heads() const { return pImpl->num_heads_; }
+int PEEROperatorEnhanced::input_dim() const { return pImpl->input_dim_; }
+int PEEROperatorEnhanced::output_dim() const { return pImpl->output_dim_; }
 
 // ======================== SMOKE TEST ========================
 

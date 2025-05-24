@@ -135,15 +135,15 @@ torch::Tensor peer_forward(
             // Direct mode: Use PyTorch tensors directly (zero-copy)
             // This is more efficient but requires PyTorch tensors to remain valid
             g_peer_op->set_weight_pointers(
-                expert_weights_u.data_ptr<at::Half>(),
-                expert_weights_v.data_ptr<at::Half>()
+                reinterpret_cast<const __half*>(expert_weights_u.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(expert_weights_v.data_ptr<at::Half>())
             );
         } else {
             // Traditional mode: Copy weights on every forward pass
             // This ensures training updates are reflected but has copy overhead
             g_peer_op->copy_weights_from_torch(
-                expert_weights_u.data_ptr<at::Half>(),
-                expert_weights_v.data_ptr<at::Half>()
+                reinterpret_cast<const __half*>(expert_weights_u.data_ptr<at::Half>()),
+                reinterpret_cast<const __half*>(expert_weights_v.data_ptr<at::Half>())
             );
         }
     }
@@ -153,14 +153,14 @@ torch::Tensor peer_forward(
     
     // Call the CUTLASS kernel
     g_peer_op->forward(
-        x.data_ptr<at::Half>(),
-        query_weight.data_ptr<at::Half>(),
-        query_bias.numel() > 0 ? query_bias.data_ptr<at::Half>() : nullptr,
-        key_weight_1.data_ptr<at::Half>(),
-        key_weight_2.data_ptr<at::Half>(),
-        output.data_ptr<at::Half>(),
-        ln_weight.numel() > 0 ? ln_weight.data_ptr<at::Half>() : nullptr,
-        ln_bias.numel() > 0 ? ln_bias.data_ptr<at::Half>() : nullptr,
+        reinterpret_cast<const __half*>(x.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(query_weight.data_ptr<at::Half>()),
+        query_bias.numel() > 0 ? reinterpret_cast<const __half*>(query_bias.data_ptr<at::Half>()) : nullptr,
+        reinterpret_cast<const __half*>(key_weight_1.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(key_weight_2.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
+        ln_weight.numel() > 0 ? reinterpret_cast<const __half*>(ln_weight.data_ptr<at::Half>()) : nullptr,
+        ln_bias.numel() > 0 ? reinterpret_cast<const __half*>(ln_bias.data_ptr<at::Half>()) : nullptr,
         batch_size,
         seq_len,
         static_cast<float>(dropout_rate),
