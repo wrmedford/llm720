@@ -57,7 +57,24 @@ def compile_cutlass_kernel_jit(num_heads: int, query_dim: int, num_experts: int,
     # Generate a custom wrapper that instantiates the specific template
     wrapper_content = f"""
 #include <torch/extension.h>
-#include "peer_cutlass_wrapper.cpp"
+#include <cuda_runtime.h>
+
+// Forward declarations
+torch::Tensor peer_forward(
+    torch::Tensor x,              // Input tensor
+    torch::Tensor query_weight,   // Query projection weight 
+    torch::Tensor query_bias,     // Query projection bias
+    torch::Tensor key_weight_1,   // First key weight
+    torch::Tensor key_weight_2,   // Second key weight  
+    torch::Tensor expert_weights_u,  // Expert U weights
+    torch::Tensor expert_weights_v,  // Expert V weights
+    torch::Tensor output,         // Output tensor
+    torch::Tensor ln_weight,      // Layer norm weight
+    torch::Tensor ln_bias,        // Layer norm bias
+    bool layer_norm
+);
+
+void print_cache_stats();
 
 // Force instantiation of specific template configuration
 namespace {{
@@ -82,10 +99,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     temp_wrapper.write_text(wrapper_content)
     
     try:
+        # Get CUTLASS include paths
+        import os
+        cutlass_base = Path(__file__).parent.parent.parent.parent / "cutlass"
+        cutlass_include = cutlass_base / "include"
+        cutlass_util_include = cutlass_base / "tools" / "util" / "include"
+        
+        # Get the actual source files
+        wrapper_cpp = Path(__file__).parent / "peer_cutlass_wrapper.cpp"
+        
         # Compile with specific defines
         module = cpp_ext.load(
             name=f"peer_cutlass_{config_key}",
-            sources=[str(temp_wrapper), str(cuda_file)],
+            sources=[str(temp_wrapper), str(cuda_file), str(wrapper_cpp)],
+            extra_include_paths=[
+                str(cutlass_include),
+                str(cutlass_util_include),
+            ],
             extra_cflags=[
                 f"-DPEER_JIT_NUM_HEADS={num_heads}",
                 f"-DPEER_JIT_QUERY_DIM={query_dim}",
@@ -177,16 +207,14 @@ def peer_forward_cutlass(
     output_dim = expert_weights_v.shape[1]
     query_dim = query_weight.shape[2] if query_weight.dim() == 3 else query_weight.shape[1]
     
-    # JIT compile kernel for this configuration
+    # Use pre-compiled kernel module
     try:
-        kernel_module = compile_cutlass_kernel_jit(
-            num_heads, query_dim, num_experts, output_dim, top_k,
-            input_dim, expert_hidden_size
-        )
-    except Exception as e:
+        from . import peer_cutlass_module as kernel_module
+    except ImportError as e:
         raise RuntimeError(
-            f"Failed to JIT compile CUTLASS kernel: {e}. "
-            "Please use PyTorch implementation by unsetting USE_CUTLASS_KERNEL."
+            f"Failed to import CUTLASS kernel: {e}. "
+            "Please build with 'python setup.py build_ext --inplace' or "
+            "use PyTorch implementation by unsetting USE_CUTLASS_KERNEL."
         )
     
     # Ensure inputs are contiguous and in correct format
@@ -206,7 +234,7 @@ def peer_forward_cutlass(
     # Create an output tensor to be filled by the kernel
     output_tensor = torch.empty(batch_size, seq_len, output_dim, dtype=x.dtype, device=x.device)
     
-    # Call CUTLASS kernel with JIT compiled module
+    # Call CUTLASS kernel with pre-compiled module
     output = kernel_module.peer_forward(
         x,
         query_weight,
@@ -227,9 +255,9 @@ def peer_forward_cutlass(
         expert_hidden_size,
         top_k,
         layer_norm,
-        True,  # norm_keys
-        True,  # norm_query
-        dropout_rate,
+        False,  # norm_keys
+        False,  # norm_query
+        dropout_rate  # dropout_rate
     )
     
     return output

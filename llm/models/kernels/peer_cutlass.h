@@ -5,10 +5,18 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <memory>
 
 namespace peer {
 
+// Forward declaration of implementation
+struct PEEROperatorEnhancedImpl;
+
 class PEEROperatorEnhanced {
+private:
+    // PIMPL idiom - hide all implementation details
+    std::unique_ptr<PEEROperatorEnhancedImpl> pImpl;
+    
 public:
     PEEROperatorEnhanced(
         int num_experts,

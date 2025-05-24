@@ -22,7 +22,7 @@ def test_cutlass_kernel_basic():
     seq_len = 4
     input_dim = 64
     output_dim = 128
-    num_experts = 512
+    num_experts = 484  # 22 * 22 = 484 (perfect square)
     num_heads = 8
     num_experts_per_tok = 4
     expert_hidden_size = 32
@@ -36,6 +36,7 @@ def test_cutlass_kernel_basic():
         num_heads=num_heads,
         expert_hidden_size=expert_hidden_size,
         query_dim=64,
+        product_key_dim=[22, 22],  # 22 * 22 = 484 to match num_experts
         batch_norm_query=True,
     ).cuda()
     
@@ -59,7 +60,7 @@ def test_cutlass_vs_pytorch():
     seq_len = 2
     input_dim = 32
     output_dim = 32
-    num_experts = 64
+    num_experts = 64  # 8 * 8 = 64 (perfect square)
     num_heads = 4
     num_experts_per_tok = 2
     expert_hidden_size = 16
@@ -74,6 +75,7 @@ def test_cutlass_vs_pytorch():
         num_heads=num_heads,
         expert_hidden_size=expert_hidden_size,
         query_dim=32,
+        product_key_dim=[8, 8],  # 8 * 8 = 64 to match num_experts
         batch_norm_query=False,  # Disable for easier comparison
     ).cuda()
     
@@ -88,6 +90,7 @@ def test_cutlass_vs_pytorch():
         num_heads=num_heads,
         expert_hidden_size=expert_hidden_size,
         query_dim=32,
+        product_key_dim=[8, 8],  # 8 * 8 = 64 to match num_experts
         batch_norm_query=False,
     ).cuda()
     
