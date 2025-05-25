@@ -1,4 +1,4 @@
-"""Python interface for CUTLASS PEER kernel."""
+"""Python interface for CUTLASS PEER kernel with FP8 support."""
 import torch
 import os
 import subprocess
@@ -25,132 +25,11 @@ except ImportError:
 
 
 def _get_kernel_config_key(num_heads: int, query_dim: int, num_experts: int, 
-                           output_dim: int, top_k: int) -> str:
+                           output_dim: int, top_k: int, use_fp8: bool = False) -> str:
     """Generate a unique key for a kernel configuration."""
     sqrt_n = int(num_experts ** 0.5)
-    return f"h{num_heads}_q{query_dim}_e{sqrt_n}_o{output_dim}_k{top_k}"
-
-
-def compile_cutlass_kernel_jit(num_heads: int, query_dim: int, num_experts: int,
-                               output_dim: int, top_k: int, input_dim: int,
-                               expert_hidden_size: int):
-    """JIT compile a CUTLASS kernel with specific template parameters."""
-    config_key = _get_kernel_config_key(num_heads, query_dim, num_experts, output_dim, top_k)
-    
-    # Check if already compiled
-    if config_key in _compiled_kernels:
-        return _compiled_kernels[config_key]
-    
-    kernel_dir = Path(__file__).parent
-    wrapper_file = kernel_dir / "peer_cutlass_wrapper.cpp"
-    cuda_file = kernel_dir / "peer_cutlass.cu"
-    header_file = kernel_dir / "peer_cutlass.h"
-    
-    if not all(f.exists() for f in [wrapper_file, cuda_file, header_file]):
-        raise FileNotFoundError("CUTLASS kernel source files not found")
-    
-    # Create a temporary directory for this specific build
-    import torch.utils.cpp_extension as cpp_ext
-    
-    sqrt_n = int(num_experts ** 0.5)
-    
-    # Generate a custom wrapper that instantiates the specific template
-    wrapper_content = f"""
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-
-// Forward declarations
-torch::Tensor peer_forward(
-    torch::Tensor x,              // Input tensor
-    torch::Tensor query_weight,   // Query projection weight 
-    torch::Tensor query_bias,     // Query projection bias
-    torch::Tensor key_weight_1,   // First key weight
-    torch::Tensor key_weight_2,   // Second key weight  
-    torch::Tensor expert_weights_u,  // Expert U weights
-    torch::Tensor expert_weights_v,  // Expert V weights
-    torch::Tensor output,         // Output tensor
-    torch::Tensor ln_weight,      // Layer norm weight
-    torch::Tensor ln_bias,        // Layer norm bias
-    bool layer_norm
-);
-
-void print_cache_stats();
-
-// Force instantiation of specific template configuration
-namespace {{
-    const int PEER_NUM_HEADS = {num_heads};
-    const int PEER_QUERY_DIM = {query_dim};
-    const int PEER_SQRT_N = {sqrt_n};
-    const int PEER_OUTPUT_DIM = {output_dim};
-    const int PEER_TOP_K = {top_k};
-    const int PEER_INPUT_DIM = {input_dim};
-    const int PEER_EXPERT_HIDDEN = {expert_hidden_size};
-}}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-    m.def("peer_forward", &peer_forward, "PEER forward pass (CUTLASS)");
-    m.def("print_cache_stats", &print_cache_stats, "Print cache statistics");
-}}
-"""
-    
-    # Create temporary wrapper file
-    temp_dir = tempfile.mkdtemp(prefix="peer_cutlass_")
-    temp_wrapper = Path(temp_dir) / "wrapper_jit.cpp"
-    temp_wrapper.write_text(wrapper_content)
-    
-    try:
-        # Get CUTLASS include paths
-        import os
-        cutlass_base = Path(__file__).parent.parent.parent.parent / "cutlass"
-        cutlass_include = cutlass_base / "include"
-        cutlass_util_include = cutlass_base / "tools" / "util" / "include"
-        
-        # Get the actual source files
-        wrapper_cpp = Path(__file__).parent / "peer_cutlass_wrapper.cpp"
-        
-        # Compile with specific defines
-        module = cpp_ext.load(
-            name=f"peer_cutlass_{config_key}",
-            sources=[str(temp_wrapper), str(cuda_file), str(wrapper_cpp)],
-            extra_include_paths=[
-                str(cutlass_include),
-                str(cutlass_util_include),
-            ],
-            extra_cflags=[
-                f"-DPEER_JIT_NUM_HEADS={num_heads}",
-                f"-DPEER_JIT_QUERY_DIM={query_dim}",
-                f"-DPEER_JIT_SQRT_N={sqrt_n}",
-                f"-DPEER_JIT_OUTPUT_DIM={output_dim}",
-                f"-DPEER_JIT_TOP_K={top_k}",
-                "-std=c++17",
-            ],
-            extra_cuda_cflags=[
-                f"-DPEER_JIT_NUM_HEADS={num_heads}",
-                f"-DPEER_JIT_QUERY_DIM={query_dim}",
-                f"-DPEER_JIT_SQRT_N={sqrt_n}",
-                f"-DPEER_JIT_OUTPUT_DIM={output_dim}",
-                f"-DPEER_JIT_TOP_K={top_k}",
-                "-O3",
-                "-std=c++17",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "--use_fast_math",
-                "-gencode=arch=compute_80,code=sm_80",  # A100
-                "-gencode=arch=compute_90,code=sm_90",  # H100
-            ],
-            verbose=False
-        )
-        
-        _compiled_kernels[config_key] = module
-        return module
-        
-    finally:
-        # Clean up temporary directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    fp8_suffix = "_fp8" if use_fp8 else ""
+    return f"h{num_heads}_q{query_dim}_e{sqrt_n}_o{output_dim}_k{top_k}{fp8_suffix}"
 
 
 def compile_cutlass_kernel():
@@ -178,9 +57,10 @@ def peer_forward_cutlass(
     layer_norm: bool = True,
     ln_weight: Optional[torch.Tensor] = None,
     ln_bias: Optional[torch.Tensor] = None,
+    use_fp8: bool = False,  # Add FP8 flag
 ) -> torch.Tensor:
     """
-    CUTLASS implementation of PEER forward pass.
+    CUTLASS implementation of PEER forward pass with optional FP8 support.
     
     Args:
         x: Input tensor [batch_size, seq_len, input_dim]
@@ -198,6 +78,7 @@ def peer_forward_cutlass(
         layer_norm: Whether to apply layer normalization to queries
         ln_weight: Layer norm weight [num_heads, query_dim] if layer_norm=True
         ln_bias: Layer norm bias [num_heads, query_dim] if layer_norm=True
+        use_fp8: Whether to use FP8 expert weights (converts internally)
         
     Returns:
         Output tensor [batch_size, seq_len, output_dim]
@@ -206,6 +87,10 @@ def peer_forward_cutlass(
     batch_size, seq_len, input_dim = x.shape
     output_dim = expert_weights_v.shape[1]
     query_dim = query_weight.shape[2] if query_weight.dim() == 3 else query_weight.shape[1]
+    
+    # Check if FP8 is requested
+    use_fp8_env = os.environ.get("PEER_USE_FP8", "0") == "1"
+    use_fp8 = use_fp8 or use_fp8_env
     
     # Use pre-compiled kernel module
     try:
@@ -224,8 +109,15 @@ def peer_forward_cutlass(
         query_bias = query_bias.contiguous().half()
     key_weight_1 = key_weight_1.contiguous().half()
     key_weight_2 = key_weight_2.contiguous().half()
-    expert_weights_u = expert_weights_u.contiguous().half()
-    expert_weights_v = expert_weights_v.contiguous().half()
+    
+    # Handle expert weights - convert to FP8 if requested
+    if use_fp8:
+        # The kernel will handle FP8 conversion internally
+        expert_weights_u = expert_weights_u.contiguous().half()
+        expert_weights_v = expert_weights_v.contiguous().half()
+    else:
+        expert_weights_u = expert_weights_u.contiguous().half()
+        expert_weights_v = expert_weights_v.contiguous().half()
     
     if layer_norm and ln_weight is not None:
         ln_weight = ln_weight.contiguous().half()
@@ -235,7 +127,14 @@ def peer_forward_cutlass(
     output_tensor = torch.empty(batch_size, seq_len, output_dim, dtype=x.dtype, device=x.device)
     
     # Call CUTLASS kernel with pre-compiled module
-    output = kernel_module.peer_forward(
+    # The module should have a peer_forward_fp8 function if FP8 is supported
+    forward_fn = getattr(kernel_module, 'peer_forward_fp8' if use_fp8 else 'peer_forward', None)
+    if forward_fn is None:
+        if use_fp8:
+            warnings.warn("FP8 support not available in compiled kernel. Falling back to FP16.")
+        forward_fn = kernel_module.peer_forward
+    
+    output = forward_fn(
         x,
         query_weight,
         query_bias if query_bias is not None else torch.empty(0, dtype=torch.half, device=x.device),
@@ -243,7 +142,7 @@ def peer_forward_cutlass(
         key_weight_2,
         expert_weights_u,
         expert_weights_v,
-        output_tensor,  # Pass the pre-allocated output tensor here
+        output_tensor,
         ln_weight if layer_norm and ln_weight is not None else torch.empty(0, dtype=torch.half, device=x.device),
         ln_bias if layer_norm and ln_bias is not None else torch.empty(0, dtype=torch.half, device=x.device),
         batch_size,
@@ -257,7 +156,8 @@ def peer_forward_cutlass(
         layer_norm,
         False,  # norm_keys
         False,  # norm_query
-        dropout_rate  # dropout_rate
+        dropout_rate,
+        use_fp8  # Pass FP8 flag to kernel
     )
     
     return output

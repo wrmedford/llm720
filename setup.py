@@ -37,6 +37,7 @@ if CUDA_AVAILABLE and os.environ.get("BUILD_CUTLASS_KERNEL", "1") == "1":
                 "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_HALF2_OPERATORS__",
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_FP8_CONVERSIONS__",  # Enable FP8 conversions
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
                 "--use_fast_math",
