@@ -50,6 +50,21 @@ We recommend using `uv` for faster environment management.
     # uv pip install --no-build-isolation -e .
     ```
 
+### Flash Attention 3 (Required)
+
+Flash Attention 3 is required for the MLA implementation. Install it from the hopper directory:
+
+```bash
+# Clone flash-attention repository if not already available
+git clone https://github.com/Dao-AILab/flash-attention.git
+cd flash-attention/hopper
+
+# Install FA3 (requires CUDA >= 12.3, recommended 12.8)
+python setup.py install
+```
+
+Note: FA3 is optimized for Hopper GPUs (H100/H800) but will work on other GPUs with appropriate compute capability.
+
 ### Building CUTLASS Kernel (Optional)
 
 For optimized performance on NVIDIA H100/A100 GPUs, you can build the CUTLASS kernel:

@@ -20,25 +20,7 @@ pytestmark = pytest.mark.skipif(
 
 # --- Test Configurations ---
 test_configs = [
-    # Basic FP32 config
-    pytest.param(
-        {
-            "id": "fp32_prefill",
-            "dtype": torch.float32,
-            "hidden_size": 128,
-            "num_heads": 4,
-            "q_lora_rank": None,
-            "kv_lora_rank": 32,
-            "qk_rope_head_dim": 16,
-            "v_head_dim": 32,
-            "qk_nope_head_dim": 16,
-            "dropout": 0.0,
-            "max_seq_len": 64,
-            "rope_base": 10000.0,
-        },
-        id="fp32_prefill",
-    ),
-    # FP16 config
+    # FP16 config (FA3 requirement)
     pytest.param(
         {
             "id": "fp16_prefill",
@@ -55,6 +37,27 @@ test_configs = [
             "rope_base": 10000.0,
         },
         id="fp16_prefill",
+    ),
+    # BF16 config
+    pytest.param(
+        {
+            "id": "bf16_prefill",
+            "dtype": torch.bfloat16,
+            "hidden_size": 128,
+            "num_heads": 4,
+            "q_lora_rank": None,
+            "kv_lora_rank": 32,
+            "qk_rope_head_dim": 16,
+            "v_head_dim": 32,
+            "qk_nope_head_dim": 16,
+            "dropout": 0.0,
+            "max_seq_len": 64,
+            "rope_base": 10000.0,
+        },
+        id="bf16_prefill",
+        marks=pytest.mark.skipif(
+            not torch.cuda.is_bf16_supported(), reason="BF16 not supported"
+        ),
     ),
 ]
 
@@ -95,9 +98,10 @@ def rope_caches(mla_config):
 
     # Use the PositionalEmbedding class to generate caches
     pos_emb = PositionalEmbedding(dim=rope_dim, max_seq_len=max_seq_len, base=base)
-    # Generate cache up to max_seq_len
-    cos, sin = pos_emb(max_seq_len)
-    return cos.to(device).to(dtype), sin.to(device).to(dtype)
+    # Generate position_ids for the full sequence
+    position_ids = torch.arange(max_seq_len, dtype=torch.long, device=device)
+    cos, sin = pos_emb(position_ids, device=device)
+    return cos.to(dtype), sin.to(dtype)  # Already on device
 
 
 @pytest.fixture(scope="module")
@@ -202,67 +206,65 @@ def test_mla_prefill_forward_shape(mla_module, sample_prefill_data, mla_config):
     assert not torch.isnan(present_k_pe).any(), "Cache k_pe contains NaNs"
 
 
-def test_mla_prefill_vs_sdpa(mla_module, sample_prefill_data, mla_config):
+def test_mla_prefill_gradient_flow(mla_module, sample_prefill_data, mla_config):
     """
-    Tests that the FlashAttention prefill path produces similar results to the SDPA fallback.
-    This helps verify the correctness of the optimized implementation.
+    Tests that gradients flow correctly through the MLA module with FA3.
+    This ensures backward pass is working properly for training.
     """
     hidden_states, position_ids, attention_mask, cos, sin = sample_prefill_data
     
-    # Skip for certain configurations where numerical differences might be larger
-    if mla_config["dtype"] == torch.float16:
-        # FP16 can have larger numerical differences between implementations
-        pytest.skip("Skipping SDPA comparison for FP16 due to potential numerical differences")
+    # Set module to training mode and zero gradients
+    mla_module.train()
+    mla_module.zero_grad()
     
-    # We'll need to patch the HAS_FLASH_ATTN variable to force SDPA path
-    from unittest.mock import patch
-    import llm.models.attention
+    # Clone and enable gradients
+    hidden_states = hidden_states.clone().requires_grad_(True)
     
-    # First run with FlashAttention (if available)
-    with torch.no_grad():
-        # Use the actual implementation (which might be FlashAttention or SDPA already)
-        flash_output, _, _ = mla_module(
-            hidden_states=hidden_states,
-            cos=cos,
-            sin=sin,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=None,
-            use_cache=True,
-            output_attentions=False,
-        )
+    # Run forward pass
+    attn_output, _, _ = mla_module(
+        hidden_states=hidden_states,
+        cos=cos,
+        sin=sin,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=None,
+        use_cache=False,  # Don't need cache for gradient test
+        output_attentions=False,
+    )
     
-    # Now force SDPA path by patching HAS_FLASH_ATTN
-    with torch.no_grad(), patch.object(llm.models.attention, 'HAS_FLASH_ATTN', False):
-        sdpa_output, _, _ = mla_module(
-            hidden_states=hidden_states,
-            cos=cos,
-            sin=sin,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=None,
-            use_cache=True,
-            output_attentions=False,
-        )
+    # Create a simple loss and backward
+    loss = attn_output.sum()
+    loss.backward()
     
-    # Compare outputs - they should be similar but not identical due to different algorithms
-    # Use a relatively loose tolerance for FP32
-    rtol = 1e-2  # Relative tolerance
-    atol = 1e-2  # Absolute tolerance
+    # Check that gradients were computed
+    assert hidden_states.grad is not None, "No gradients computed for hidden_states"
+    assert not torch.isnan(hidden_states.grad).any(), "Gradients contain NaNs"
+    assert not torch.isinf(hidden_states.grad).any(), "Gradients contain Infs"
     
-    # Check if outputs are close enough
-    try:
-        assert torch.allclose(flash_output, sdpa_output, rtol=rtol, atol=atol), \
-            "FlashAttention and SDPA outputs differ significantly"
-    except AssertionError as e:
-        # If they're not close, print some diagnostics
-        max_diff = torch.max(torch.abs(flash_output - sdpa_output))
-        mean_diff = torch.mean(torch.abs(flash_output - sdpa_output))
-        print(f"Max difference: {max_diff.item()}, Mean difference: {mean_diff.item()}")
-        
-        # If the difference is very large, fail the test
-        if max_diff > 0.1:  # Arbitrary threshold for "very different"
-            raise e
-        else:
-            # Otherwise just warn but pass the test
-            print("Warning: Outputs differ but within acceptable range for different implementations")
+    # Check that model parameters have gradients
+    for name, param in mla_module.named_parameters():
+        if param.requires_grad:
+            assert param.grad is not None, f"No gradient computed for {name}"
+            assert not torch.isnan(param.grad).any(), f"Gradient for {name} contains NaNs"
+    
+    # Set back to eval mode
+    mla_module.eval()
+
+
+def test_mla_q_to_v_projection(mla_module, mla_config):
+    """
+    Tests that the q_to_v_proj layer is properly initialized when v_head_dim != q_head_dim.
+    This is required for FA3 support with different head dimensions.
+    """
+    v_head_dim = mla_config["v_head_dim"]
+    q_head_dim = mla_config["qk_nope_head_dim"] + mla_config["qk_rope_head_dim"]
+    
+    if v_head_dim != q_head_dim:
+        # Should have q_to_v_proj layer
+        assert hasattr(mla_module, 'q_to_v_proj'), "Missing q_to_v_proj layer when v_head_dim != q_head_dim"
+        assert isinstance(mla_module.q_to_v_proj, torch.nn.Linear), "q_to_v_proj should be a Linear layer"
+        assert mla_module.q_to_v_proj.in_features == q_head_dim, f"q_to_v_proj input dim mismatch: {mla_module.q_to_v_proj.in_features} != {q_head_dim}"
+        assert mla_module.q_to_v_proj.out_features == v_head_dim, f"q_to_v_proj output dim mismatch: {mla_module.q_to_v_proj.out_features} != {v_head_dim}"
+    else:
+        # Should not have q_to_v_proj layer
+        assert not hasattr(mla_module, 'q_to_v_proj'), "q_to_v_proj should not exist when v_head_dim == q_head_dim"

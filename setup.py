@@ -67,7 +67,9 @@ setup(
         "seaborn>=0.12.0",
         "pandas>=1.3.0",
         "tabulate>=0.8.0",
-        "flash-attn>=2.0.0; platform_system=='Linux'", # flash-attn is often Linux-only
+        # Flash Attention 3 is a hard requirement for MLA support
+        # Install from source: cd flash-attention/hopper && python setup.py install
+        "flash-attn-3>=3.0.0b1; platform_system=='Linux'",  # FA3 required for Hopper GPUs
         "torchao>=0.10.0", # Use torchao for FP8 and other optimizations
         "pynvml>=11.0.0",  # For GPU monitoring
         "tiktoken>=0.7.0", # Added tiktoken dependency

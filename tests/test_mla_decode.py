@@ -21,25 +21,7 @@ pytestmark = pytest.mark.skipif(
 
 # --- Test Configurations ---
 test_configs = [
-    # Basic FP32 config
-    pytest.param(
-        {
-            "id": "fp32",
-            "dtype": torch.float32,
-            "hidden_size": 128,
-            "num_heads": 4,
-            "q_lora_rank": None,
-            "kv_lora_rank": 32,
-            "qk_rope_head_dim": 16,
-            "v_head_dim": 32,
-            "qk_nope_head_dim": 16,
-            "dropout": 0.0,
-            "max_seq_len": 64,
-            "rope_base": 10000.0,
-        },
-        id="fp32",
-    ),
-    # FP16 config
+    # FP16 config (FA3 requirement)
     pytest.param(
         {
             "id": "fp16",
@@ -78,11 +60,11 @@ test_configs = [
             not torch.cuda.is_bf16_supported(), reason="BF16 not supported"
         ),
     ),
-    # Config with Q LoRA
+    # Config with Q LoRA - FP16
     pytest.param(
         {
-            "id": "qlora_fp32",
-            "dtype": torch.float32,
+            "id": "qlora_fp16",
+            "dtype": torch.float16,
             "hidden_size": 128,
             "num_heads": 4,
             "q_lora_rank": 64,
@@ -94,7 +76,7 @@ test_configs = [
             "max_seq_len": 64,
             "rope_base": 10000.0,
         },
-        id="qlora_fp32",
+        id="qlora_fp16",
     ),
 ]
 
@@ -128,18 +110,17 @@ def mla_module(mla_config):
 def rope_caches(mla_config):
     """Generates RoPE sin/cos caches."""
     device = torch.device("cuda")
-    dtype = mla_config["dtype"]  # RoPE cache often kept in FP32 for precision
+    dtype = mla_config["dtype"]
     rope_dim = mla_config["qk_rope_head_dim"]
     max_seq_len = mla_config["max_seq_len"]
     base = mla_config["rope_base"]
 
     # Use the PositionalEmbedding class to generate caches
     pos_emb = PositionalEmbedding(dim=rope_dim, max_seq_len=max_seq_len, base=base)
-    # Generate cache up to max_seq_len
-    cos, sin = pos_emb(max_seq_len)
-    return cos.to(device).to(dtype), sin.to(device).to(
-        dtype
-    )  # Move to device and potentially cast
+    # Generate position_ids for the full sequence
+    position_ids = torch.arange(max_seq_len, dtype=torch.long, device=device)
+    cos, sin = pos_emb(position_ids, device=device)
+    return cos.to(dtype), sin.to(dtype)  # Already on device
 
 
 @pytest.fixture(scope="module")
