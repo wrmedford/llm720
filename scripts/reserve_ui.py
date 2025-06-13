@@ -537,7 +537,7 @@ class TerminalUI:
             self.add_status_message(f"Warning: Region was a list, using first: {region}")
         
         self.add_status_message(f"Launching {name} in {region}...")
-        result = self.client.launch_instance(region, name, self.ssh_key_name, instance_name)
+        api_response, error_msg = self.client.launch_instance(region, name, self.ssh_key_name, instance_name)
         
         if result and result.get("data", {}).get("instance_ids"):
             instance_id = result["data"]["instance_ids"][0]
