@@ -22,3 +22,7 @@ LLM720 gets its namesake from [LLM360](https://arxiv.org/pdf/2312.06550), where 
 ## Join us on Discord
 
 [![](https://dcbadge.limes.pink/api/server/https://discord.gg/5DgUmSB2uP)](https://discord.gg/https://discord.gg/5DgUmSB2uP)
+
+## Special Thanks
+
+Thank you to @lambdal for providing compute for this project.
