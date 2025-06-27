@@ -1,95 +1,24 @@
-# Foundation Language Model Training Framework
+#LLM720
 
-This repository provides a framework for training large language models (LLMs) with a focus on parameter efficiency and cost-effective training, drawing inspiration from recent research by DeepSeek (e.g., DeepSeek-V2/V3, Mixture-of-A-Million-Experts).
+LLM720 is a second generation Large Language Model that aims to be:
 
-## About This Project
+1. Open
+2. Interpretable
+3. Energy efficient
 
-The goal is to build powerful LLMs that are efficient to train and run, leveraging sparse activation of a vast number of parameters. This framework implements two core architectural innovations:
+These goals are all accomplished through the same guiding design: Make a model that is as sparse as possible, so you can see exactly which weights are contributing to output while simultaneously not using more compute than necessary. 
 
-1.  **Parameter Efficient Expert Retrieval (PEER):** An advanced Mixture-of-Experts (MoE) layer designed to scale to millions of tiny experts, using efficient "product key" retrieval.
-2.  **Multi-Headed Latent Attention (MLA):** An efficient attention mechanism based on the DeepSeek V3 architecture, employing techniques like low-rank projections and RoPE/NoPE decomposition.
+We aim to accomplish this through a fine grained Mixture of Experts architecture (He, 2024), while utilizing efficient attention mechanisms initially pioneered by DeepSeek with Multi-Headed Latent Attention (Deepseek, 2024). This project is also exploring expanding model weights into system memory while maintaining performance with the hope of making frontier models less bound by GPU memory capacity by expanding on the Mixture of a Million Experts architecture originally developed by He. 
 
-See [Architecture Details](docs/ARCHITECTURE.md) for more information.
+LLM720 gets its namesake from [LLM360](https://arxiv.org/pdf/2312.06550), where we intend to carry the torch of completely open-sourced model development (Liu et al, 2023). 
 
-## Features
+## Quick Start
 
--   **PEER** for efficient expert selection with optional CUTLASS kernel acceleration.
--   **MLA** for optimized attention.
--   **Dataset Management:** Streaming, interleaving, and configurable tokenization.
--   **Robust Training Pipeline:** Checkpointing, resuming, and distributed training support.
--   **Evaluation Integration:** Perplexity and benchmark evaluations (e.g., MMLU, MATH).
--   **Configuration System:** YAML-based configuration.
--   **Weights & Biases Integration:** Detailed metrics, logging, and expert usage tracking.
--   **Ablation Testing Framework:** Systematically test different configurations.
--   **Optimized Kernels:** CUTLASS-based PEER kernel for H100/A100 GPUs with hierarchical memory management.
-
-## Installation
-
-We recommend using `uv` for faster environment management.
-
-1.  **Install `uv`:**
-    ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    ```
-2.  **Create and activate environment:**
-    ```bash
-    uv venv
-    source .venv/bin/activate
-    ```
-3.  **Install PyTorch:** Match your CUDA version (see [pytorch.org](https://pytorch.org/)).
-    ```bash
-    # Example for CUDA 12.1 - Adjust if necessary!
-    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    ```
-4.  **Install the package:**
-    ```bash
-    # Install with dev and eval dependencies (recommended for full functionality)
-    uv pip install --no-build-isolation -e ".[dev,evals]"
-
-    # Or install base package only
-    # uv pip install --no-build-isolation -e .
-    ```
-
-### Building CUTLASS Kernel (Optional)
-
-For optimized performance on NVIDIA H100/A100 GPUs, you can build the CUTLASS kernel:
-
-```bash
-# The kernel will be built automatically when needed, or you can build it manually:
-python setup.py build_ext --inplace
-
-# To disable CUTLASS kernel building:
-export BUILD_CUTLASS_KERNEL=0
-```
-
-For detailed installation instructions, including **building dependencies from source** (e.g., for ARM/GH200 or specific CUDA versions), see [Installation Guide](docs/INSTALLATION.md).
-
-## Getting Started
-
-1.  **Install** dependencies (see above).
-2.  **Prepare** your configuration file (see `configs/config.yaml` and [Configuration Guide](docs/CONFIGURATION.md)).
-3.  **Start training:**
-    ```bash
-    # Single GPU / Single Node
-    python scripts/train.py --config configs/config.yaml
-
-    # Distributed Training (Example: 8 GPUs on one node)
-    ./scripts/train.sh --config configs/config.yaml --gpus-per-node 8
-    
-    # Use CUTLASS kernel for PEER (for H100/A100 GPUs)
-    export USE_CUTLASS_KERNEL=1
-    python scripts/train.py --config configs/config.yaml
-    ```
+- **Installation**: See [`docs/INSTALLATION.md`](docs/INSTALLATION.md)
+- **Architecture**: See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- **Configuration**: See [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)
+- **Full Documentation**: Browse the [`docs/`](docs/) directory
 
 ## Join us on Discord
 
 [![](https://dcbadge.limes.pink/api/server/https://discord.gg/5DgUmSB2uP)](https://discord.gg/https://discord.gg/5DgUmSB2uP)
-
-## Further Documentation
-
--   [Architecture Details (PEER & MLA)](docs/ARCHITECTURE.md)
--   [Installation Guide](docs/INSTALLATION.md)
--   [Configuration Guide](docs/CONFIGURATION.md)
--   [Model Analysis](docs/ANALYSIS.md)
--   [Expert Usage Monitoring](docs/EXPERT_MONITORING.md)
--   [Ablation Testing](docs/ABLATION_TESTING.md)
