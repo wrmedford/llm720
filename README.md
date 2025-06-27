@@ -1,4 +1,4 @@
-#LLM720
+# LLM720
 
 LLM720 is a second generation Large Language Model that aims to be:
 
